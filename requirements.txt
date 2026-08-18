@@ -1,0 +1,4 @@
+ccxt
+supabase
+cryptography
+dotenv
