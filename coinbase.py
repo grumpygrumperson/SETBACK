@@ -3,18 +3,52 @@ import logging
 import os
 from cryptography.fernet import Fernet, InvalidToken
 from dotenv import load_dotenv
-from readfile import *
 
 
 load_dotenv()
 
-exchange = ccxt.coinbase({
-    'apiKey': os.getenv("COINBASE_APIKEY"),
-    'secret': os.getenv("COINBASE_SECRET"),
-    'enableRateLimit': True,
-})
+# Your own keys, by venue. Coinbase issues separate credentials for spot and
+# perps, so each venue reads its own pair. Participants' keys never come from
+# here - those are decrypted out of Supabase by build_exchange().
+ENV_CREDENTIALS = {
+    'spot': ('COINBASE_APIKEY', 'COINBASE_SECRET'),
+    'perp': ('COINBASEPERP_APIKEY', 'COINBASEPERP_SECRET'),
+}
 
 _fernet: Fernet = None
+
+
+def exchange_from_env(account_type: str = 'spot') -> ccxt.Exchange:
+    """
+    Build an exchange from your own .env keys - for local testing and ad hoc
+    scripts only. The scheduled sync builds participants' exchanges with
+    build_exchange() instead.
+
+    'perp' additionally reads COINBASEPERP_PORTFOLIO if set; without it the
+    perp functions discover the portfolio UUID on first use.
+    """
+    if account_type not in ENV_CREDENTIALS:
+        raise ValueError(
+            f"Unknown account_type '{account_type}' - expected one of "
+            f"{sorted(ENV_CREDENTIALS)}"
+        )
+
+    key_var, secret_var = ENV_CREDENTIALS[account_type]
+    api_key, api_secret = os.getenv(key_var), os.getenv(secret_var)
+
+    if not api_key or not api_secret:
+        raise RuntimeError(
+            f"{key_var} and {secret_var} must both be set in .env to use the "
+            f"{account_type} account"
+        )
+
+    return build_exchange(
+        api_key,
+        api_secret,
+        'coinbase',
+        encrypted=False,  # .env keys are plaintext, unlike the Supabase ones
+        portfolio_uuid=os.getenv("COINBASEPERP_PORTFOLIO") if account_type == 'perp' else None,
+    )
 
 def _get_fernet() -> Fernet:
     """
@@ -36,14 +70,18 @@ def build_exchange(api_key: str, api_secret: str, exchange_id: str = 'coinbase',
                    encrypted: bool = True, passphrase: str = None,
                    portfolio_uuid: str = None, **options) -> ccxt.Exchange:
     """
-    Build a ccxt exchange instance for a single participant.
+    Build a ccxt exchange instance for ONE of a participant's venues.
 
-    Credentials in the `participants_credentials` table are Fernet-encrypted
-    by sign_ups.py, so `encrypted` defaults to True - that's the pipeline path.
-    Pass encrypted=False for plaintext keys (e.g. your own from .env).
+    Spot and perps use different Coinbase API keys, so a participant has one
+    `participant_api_keys` row per venue and this is called once per row -
+    never reuse an instance built from spot keys to reach perp endpoints.
+
+    Credentials in `participant_api_keys` are Fernet-encrypted by sign_ups.py,
+    so `encrypted` defaults to True - that's the pipeline path. Pass
+    encrypted=False for plaintext keys (e.g. your own from .env).
 
     `exchange_id` must match ccxt's exact id (see ccxt.exchanges), which is
-    what the `exchange` column of participants_credentials stores.
+    what the `exchange` column of participant_api_keys stores.
 
     `passphrase` is only needed by venues whose requiredCredentials include
     'password' - coinbaseinternational does, plain coinbase does not.
@@ -154,7 +192,7 @@ def price_balances_in_usdc(exchange: ccxt.Exchange, balances: dict = None, price
     return total_usdc_value
 
 if __name__ == "__main__":
-    print(price_balances_in_usdc(exchange))
+    print(price_balances_in_usdc(exchange_from_env('spot')))
 
 
 def _amount(field, default: float = 0.0) -> float:
@@ -359,7 +397,8 @@ def get_account_totals_usdc(exchange: ccxt.Exchange, account_type: str = 'spot',
     return account_totals                
 
 if __name__ == "__main__":
-     print(get_account_totals_usdc(exchange))                                 
+    print(get_account_totals_usdc(exchange_from_env('spot'), account_type='spot'))
+    print(get_account_totals_usdc(exchange_from_env('perp'), account_type='perp'))
 
 
 def account_type_from_order(order: dict) -> str:
