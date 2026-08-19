@@ -5,6 +5,26 @@ from coinbase import build_exchange, closed_orders, get_account_totals_usdc
 
 load_dotenv()
 
+
+def _require_env(*names: str) -> None:
+    """
+    Fail with a readable message naming what's missing, rather than letting a
+    library raise several frames deep. On a scheduled runner the environment
+    is the most common thing to get wrong, and the default traceback doesn't
+    say which variable was absent.
+    """
+    missing = [n for n in names if not os.getenv(n)]
+    if missing:
+        raise RuntimeError(
+            "Missing required environment variable(s): " + ", ".join(missing) +
+            ". Set them in your .env locally, or in the service's Variables "
+            "on your host. FERNET_KEY must be identical to the key that "
+            "encrypted the stored credentials, or nothing will decrypt."
+        )
+
+
+_require_env("SUPABASE_URL", "SUPABASE_KEY", "FERNET_KEY")
+
 supabase = create_client(os.getenv("SUPABASE_URL"),
                          os.getenv("SUPABASE_KEY"))
 
