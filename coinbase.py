@@ -1,7 +1,7 @@
 import ccxt
 import logging
 import os
-from cryptography.fernet import Fernet, InvalidToken
+from cryptography.fernet import Fernet, InvalidToken, MultiFernet
 from dotenv import load_dotenv
 
 
@@ -14,6 +14,31 @@ ENV_CREDENTIALS = {
     'spot': ('COINBASE_APIKEY', 'COINBASE_SECRET'),
     'perp': ('COINBASEPERP_APIKEY', 'COINBASEPERP_SECRET'),
 }
+# Deliberately only YOUR two venues. Other participants' keys belong in
+# participant_api_keys, Fernet-encrypted - putting them in .env would keep
+# live credentials in plaintext on disk, outside the encryption everything
+# else depends on. To test another participant's keys ad hoc, pass them
+# straight to build_exchange(key, secret, encrypted=False).
+
+# Stablecoins and fiat-pegged currencies treated as 1:1 with USD
+USD_EQUIVALENTS = {
+    'USDC', 'USDT', 'USD', 'BUSD', 'DAI', 'TUSD', 'USDP', 'GUSD',
+    'FDUSD', 'USDD', 'FRAX', 'LUSD', 'SUSD', 'USDN', 'USDJ', 'MAMUSD',
+}
+# Preferred quote currencies to try, in order
+QUOTE_PRIORITY = ['USDC', 'USDT', 'USD', 'BUSD', 'FDUSD']
+
+# When the competition starts. Everything that reads history - orders, trades,
+# cash flows - falls back to this when no `since` is given, so it decides what
+# counts as in-competition activity.
+#
+# One place, not three: with the date inlined per function, moving the start
+# and missing one would give you flows from a different window than orders,
+# and the returns computed from them would be quietly wrong.
+#
+# Override with COMPETITION_START in the environment to change it without a
+# redeploy - e.g. COMPETITION_START=2020-01-01T00:00:00Z to pull full history.
+COMPETITION_START = os.getenv("COMPETITION_START", "2026-01-01T00:00:00Z")
 
 _fernet: Fernet = None
 
@@ -47,13 +72,29 @@ def exchange_from_env(account_type: str = 'spot') -> ccxt.Exchange:
         api_secret,
         'coinbase',
         encrypted=False,  # .env keys are plaintext, unlike the Supabase ones
-        portfolio_uuid=os.getenv("COINBASEPERP_PORTFOLIO") if account_type == 'perp' else None,
+        portfolio_uuid=(os.getenv("COINBASEPERP_PORTFOLIO")
+                        if account_type == 'perp' else None),
     )
 
-def _get_fernet() -> Fernet:
+def _get_fernet() -> MultiFernet:
     """
-    Lazily build the Fernet cipher so importing this module doesn't require
+    Lazily build the cipher so importing this module doesn't require
     FERNET_KEY to be set (only the credential-decrypting paths need it).
+
+    Returns a MultiFernet, not a plain Fernet, so keys can be ROTATED:
+
+      FERNET_KEY           the current key. Everything is encrypted with this.
+      FERNET_KEYS_RETIRED  comma-separated older keys, decrypt-only.
+
+    MultiFernet encrypts with the first key and decrypts with any of them, so
+    a rotation doesn't strand existing rows. Without this, changing
+    FERNET_KEY orphans every stored credential at once and all 100
+    participants have to issue new exchange keys - which is why a leaked key
+    would otherwise be unrecoverable rather than merely urgent.
+
+    Rotation: put the new key in FERNET_KEY, move the old one to
+    FERNET_KEYS_RETIRED, run rotate_credentials.py, then drop the retired
+    entry once it reports everything re-encrypted.
     """
     global _fernet # sets _fernet as a global variable
     if _fernet is None:
@@ -62,7 +103,14 @@ def _get_fernet() -> Fernet:
             raise RuntimeError(
                 "FERNET_KEY is not set - cannot decrypt participant credentials"
             )
-        _fernet = Fernet(key.encode())
+
+        keys = [Fernet(key.strip().encode())]
+        retired = os.getenv("FERNET_KEYS_RETIRED", "")
+        keys.extend(
+            Fernet(k.strip().encode()) for k in retired.split(",") if k.strip()
+        )
+
+        _fernet = MultiFernet(keys)
     return _fernet
 
 
@@ -225,13 +273,18 @@ def find_perp_portfolio_uuid(exchange: ccxt.Exchange) -> str:
     logger = logging.getLogger(__name__)
 
     portfolios = exchange.fetch_portfolios()
+
+    # Match on TYPE, not name. A user can call any portfolio anything - one
+    # test account here has an ordinary CONSUMER portfolio named "perps2",
+    # which a name-based match happily returns. The INTX endpoints would then
+    # be called with a non-INTX portfolio UUID and fail, or worse, quietly
+    # value the wrong account.
     for portfolio in portfolios:
-        label = f"{portfolio.get('type') or ''} {(portfolio.get('info') or {}).get('name') or ''}".upper()
-        if 'INTX' in label or 'PERP' in label:
+        if (portfolio.get('type') or '').upper() == 'INTX':
             return portfolio.get('id')
 
     logger.warning(
-        "No perp portfolio found for this key - portfolios seen: %s",
+        "No INTX portfolio found for this key - portfolios seen: %s",
         [(p.get('type'), (p.get('info') or {}).get('name')) for p in portfolios]
     )
     return None
@@ -433,7 +486,7 @@ def closed_orders(exchange: ccxt.Exchange, symbol: str = None, since=None, limit
     get_account_totals_usdc's `timestamp` field and ccxt's own convention,
     what the automated pipeline passes) or an ISO8601 string like
     '2026-05-01T00:00:00Z' (convenient for manual/ad hoc calls) - both get
-    normalized to milliseconds internally. Defaults to 2026-01-01 if not
+    normalized to milliseconds internally. Defaults to COMPETITION_START
     given. Paginates automatically if a participant has more closed orders
     than fit in one page.
 
@@ -448,7 +501,7 @@ def closed_orders(exchange: ccxt.Exchange, symbol: str = None, since=None, limit
         request_params['retail_portfolio_id'] = portfolio_uuid
 
     if since is None:
-        since = exchange.parse8601('2026-01-01T00:00:00Z')
+        since = exchange.parse8601(COMPETITION_START)
     elif isinstance(since, str):
         since = exchange.parse8601(since)
 
@@ -533,7 +586,7 @@ def closed_trades(exchange: ccxt.Exchange, symbol: str = None, since: str = None
     if since:
         since_ms = exchange.parse8601(since)
     else:
-        since_ms = exchange.parse8601('2026-01-01T00:00:00Z')
+        since_ms = exchange.parse8601(COMPETITION_START)
 
     request_params = {}
     if portfolio_uuid:
@@ -564,3 +617,261 @@ def closed_trades(exchange: ccxt.Exchange, symbol: str = None, since: str = None
 #print(log_to_csv('closed_order_test.csv', closed_trades, exchange=exchange, since = '2026-05-01T00:00:00Z'))
 
 
+
+def _price_at_usdc(exchange: ccxt.Exchange, coin: str, timestamp_ms: int,
+                   price_cache: dict = None) -> float:
+    """
+    Price of `coin` in USDC AT a past moment, for valuing a historical
+    transfer.
+
+    Valuing an old deposit at today's price is the obvious shortcut and it's
+    wrong: a BTC deposit made at 30k would be booked at today's price, and the
+    difference lands in the participant's return as if they had traded it.
+
+    Falls back to the current ticker only if no historical candle is
+    available, and says so in the log.
+    """
+    logger = logging.getLogger(__name__)
+
+    if coin in USD_EQUIVALENTS:
+        return 1.0
+
+    if price_cache is None:
+        price_cache = {}
+
+    bucket = (coin, timestamp_ms // 3_600_000)   # cache by coin and hour
+    if bucket in price_cache:
+        return price_cache[bucket]
+
+    exchange.load_markets()
+    for quote in QUOTE_PRIORITY:
+        symbol = f"{coin}/{quote}"
+        if symbol not in exchange.markets:
+            continue
+        try:
+            candles = exchange.fetch_ohlcv(symbol, '1h', since=timestamp_ms, limit=1)
+            if candles:
+                price = float(candles[0][4])          # close
+                price_cache[bucket] = price
+                return price
+        except Exception as e:
+            logger.debug("OHLCV unavailable for %s at %s: %s", symbol, timestamp_ms, e)
+
+        try:
+            ticker = exchange.fetch_ticker(symbol)
+            price = float(ticker.get('last') or ticker.get('close') or 0)
+            if price:
+                logger.warning(
+                    "No historical candle for %s at %s - valuing at the CURRENT "
+                    "price, which overstates or understates this transfer",
+                    symbol, timestamp_ms
+                )
+                price_cache[bucket] = price
+                return price
+        except Exception as e:
+            logger.warning("Could not price %s: %s", symbol, e)
+
+    logger.warning("No market found to price %s - transfer valued at 0", coin)
+    price_cache[bucket] = 0.0
+    return 0.0
+
+
+# Coinbase's v2 transactions endpoint returns EVERYTHING that moved value,
+# and ccxt labels much of it 'deposit'/'withdrawal' - including
+# 'advanced_trade_fill', which is a TRADE. Counting those as cash flows would
+# subtract every trade from a participant's return and flatten performance to
+# roughly zero.
+#
+# So this is an allowlist, never a denylist: an unrecognised type is logged
+# and ignored, because wrongly counting a trade as funding is far more
+# damaging than missing an unusual transfer.
+EXTERNAL_TRANSFER_TYPES = {
+    'send',                 # crypto sent to / received from outside
+    'fiat_deposit',         # bank transfer in
+    'fiat_withdrawal',      # bank transfer out
+    'pro_deposit',          # moved in from Coinbase Pro / Advanced
+    'pro_withdrawal',       # moved out to Coinbase Pro / Advanced
+    'exchange_deposit',
+    'exchange_withdrawal',
+}
+
+# Recognised but deliberately NOT flows: value moving within the account
+# rather than in or out of it.
+INTERNAL_ACTIVITY_TYPES = {
+    'advanced_trade_fill',  # a trade
+    'buy', 'sell',          # fiat<->crypto conversion inside the account
+    'trade',
+    # Spot <-> INTX perp portfolio. Both venues are one competition, so
+    # moving collateral between them changes nothing about a participant's
+    # standing. Excluded here rather than left to the netting heuristic in
+    # metrics, because Coinbase reports only the spot leg - there is no
+    # matching perp-side record for the netting to pair it with.
+    'intx_deposit',
+    'intx_withdrawal',
+    # Coinbase converting one asset into another in place (a token contract
+    # migration or rename). Value carries across, so nothing entered or left
+    # the account.
+    'asset_migration',
+}
+
+
+def _transfer_currencies(exchange: ccxt.Exchange) -> list[str]:
+    """
+    Currencies worth asking Coinbase about when fetching transfers.
+
+    Coinbase's transfer history is per-currency, and it lists hundreds of
+    them. Querying all of them would dominate the sync, so this narrows to
+    what the participant actually holds plus the dollar currencies that
+    funding almost always arrives in.
+
+    The trade-off: a deposit of a coin that was later fully sold won't be
+    seen, because it no longer shows in the balance.
+    """
+    logger = logging.getLogger(__name__)
+    codes = {'USD', 'USDC'}
+
+    try:
+        balance = exchange.fetch_balance()
+        codes.update(
+            coin for coin, amount in (balance.get('total') or {}).items()
+            if coin and amount and amount > 0
+        )
+    except Exception as e:
+        logger.warning("Could not list held currencies, checking USD/USDC only: %s", e)
+
+    return sorted(codes)
+
+
+def _paginate_transfers(exchange: ccxt.Exchange, code: str, since: int,
+                        limit: int) -> list[dict]:
+    """
+    Walk a full transfer history, one page at a time.
+
+    Coinbase caps a page at 100. Without this, a participant's first backfill
+    would stop at the cap and silently drop the rest - and it fails silently,
+    because a short page and a full page look identical to the caller. Wrong
+    funding totals then feed straight into everyone's returns.
+
+    Mirrors the pagination in closed_orders: advance past the newest entry
+    seen, since ccxt sorts these ascending by timestamp.
+    """
+    logger = logging.getLogger(__name__)
+
+    entries = []
+    cursor = since
+    seen_ids = set()
+
+    while True:
+        page = exchange.fetch_deposits_withdrawals(code=code, since=cursor, limit=limit)
+        if not page:
+            break
+
+        # Guard against an exchange that ignores `since` and re-serves the
+        # same page, which would otherwise loop forever.
+        fresh = [e for e in page if e.get('id') not in seen_ids]
+        if not fresh:
+            break
+        seen_ids.update(e.get('id') for e in fresh)
+        entries.extend(fresh)
+
+        if len(page) < limit:
+            break
+
+        last_ts = page[-1].get('timestamp')
+        if last_ts is None:
+            logger.warning("Transfer page has no timestamp on its last entry - "
+                           "stopping pagination for %s", code or 'account')
+            break
+        cursor = last_ts + 1
+
+    return entries
+
+
+def get_cash_flows(exchange: ccxt.Exchange, since=None, limit: int = 100) -> list[dict]:
+    """
+    External deposits and withdrawals, valued in USDC at the time they moved.
+
+    This is what makes returns mean anything. Without it a participant who
+    deposits $1,000 mid-competition shows the transfer as profit, and every
+    return-based metric ranks funding rather than trading.
+
+    Only settled transfers count - a pending or cancelled one hasn't changed
+    the account's value.
+
+    `since` accepts milliseconds or an ISO8601 string, matching closed_orders.
+    """
+    logger = logging.getLogger(__name__)
+
+    if since is None:
+        since = exchange.parse8601(COMPETITION_START)
+    elif isinstance(since, str):
+        since = exchange.parse8601(since)
+
+    try:
+        raw = _paginate_transfers(exchange, None, since, limit)
+    except ccxt.NotSupported:
+        logger.warning("%s does not support fetching transfers - returns will "
+                       "not be adjusted for deposits", exchange.id)
+        return []
+    except ccxt.ArgumentsRequired:
+        # Coinbase answers per-currency rather than for the whole account.
+        # Iterating every currency it lists would be hundreds of calls per
+        # participant per run, so ask only about currencies they actually
+        # hold, plus the dollar ones nearly all funding arrives in.
+        raw = []
+        for code in _transfer_currencies(exchange):
+            try:
+                raw.extend(_paginate_transfers(exchange, code, since, limit))
+            except Exception as e:
+                logger.debug("No transfer history for %s: %s", code, e)
+                continue
+
+    price_cache: dict = {}
+    flows = []
+
+    for entry in raw:
+        try:
+            if entry.get('status') != 'ok':
+                continue                       # pending/cancelled moved nothing
+
+            raw_type = (entry.get('info') or {}).get('type')
+            if raw_type in INTERNAL_ACTIVITY_TYPES:
+                continue                       # a trade, not funding
+            if raw_type not in EXTERNAL_TRANSFER_TYPES:
+                logger.warning(
+                    "Ignoring transfer %s of unrecognised type '%s' - add it to "
+                    "EXTERNAL_TRANSFER_TYPES if it moves money in or out of the "
+                    "account", entry.get('id'), raw_type
+                )
+                continue
+
+            amount = entry.get('amount')
+            currency = entry.get('currency')
+            timestamp = entry.get('timestamp')
+            if not amount or not currency or timestamp is None:
+                logger.warning("Skipping transfer %s: incomplete", entry.get('id'))
+                continue
+
+            direction = 'in' if entry.get('type') == 'deposit' else 'out'
+            price = _price_at_usdc(exchange, currency, timestamp, price_cache)
+
+            flows.append({
+                'participant_id': None,        # populated by the sync
+                'account_type': None,          # populated by the sync
+                'timestamp': timestamp,
+                'datetime': entry.get('datetime'),
+                'direction': direction,
+                'currency': currency,
+                'amount': float(amount),
+                # Signed: deposits add, withdrawals subtract. Lets the metrics
+                # layer simply sum a period's flows.
+                'usdc_value': float(amount) * price * (1 if direction == 'in' else -1),
+                'transfer_id': entry.get('id'),
+                'raw_type': (entry.get('info') or {}).get('type'),
+            })
+
+        except Exception as e:
+            logger.warning("Skipping malformed transfer %s: %s", entry.get('id'), e)
+            continue
+
+    return flows

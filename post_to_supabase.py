@@ -1,7 +1,8 @@
 import os
 from supabase import create_client
 from dotenv import load_dotenv
-from coinbase import build_exchange, closed_orders, get_account_totals_usdc
+from coinbase import (build_exchange, closed_orders, get_account_totals_usdc,
+                      get_cash_flows)
 
 load_dotenv()
 
@@ -156,13 +157,67 @@ def sync_balance_snapshot(participant_id, credential: dict, exchange) -> None:
     detail = {k: v for k, v in snapshot.items()
               if k not in ("timestamp", "datetime", "account_type", "total_usdc")}
 
-    supabase.table("balance_snapshots").insert({
+    # upsert, not insert: the table is unique on
+    # (participant_id, account_type, timestamp), so a retry landing on the
+    # same millisecond would otherwise raise instead of being a no-op.
+    supabase.table("balance_snapshots").upsert({
         "participant_id": participant_id,
         "account_type": account_type,
         "timestamp": snapshot.get("timestamp"),
         "total_usdc": snapshot.get("total_usdc"),
         "detail": detail,
-    }).execute()
+    }, on_conflict="participant_id,account_type,timestamp").execute()
+
+
+def sync_cash_flows(participant_id, credential: dict, exchange) -> int:
+    """
+    Record external deposits and withdrawals for one credential.
+
+    Returns are meaningless without these: money arriving in an account looks
+    identical to money earned in it. Stored raw and unjudged - deciding which
+    transfers are internal happens in the metrics layer, where a participant's
+    venues can be compared against each other.
+    """
+    account_type = credential.get("account_type")
+
+    since = get_last_flow_timestamp(participant_id, account_type)
+    flows = get_cash_flows(exchange, since=since)
+
+    if not flows:
+        return 0
+
+    for flow in flows:
+        flow["participant_id"] = participant_id
+        flow["account_type"] = account_type
+
+    response = supabase.table("cash_flows").upsert(
+        flows,
+        on_conflict="participant_id,account_type,transfer_id",
+        ignore_duplicates=False,
+    ).execute()
+
+    return len(response.data or [])
+
+
+def get_last_flow_timestamp(participant_id, account_type: str) -> int:
+    """
+    Resume point for this credential's transfer history, mirroring
+    get_last_synced_timestamp for orders.
+    """
+    response = (
+        supabase.table("cash_flows")
+        .select("timestamp")
+        .eq("participant_id", participant_id)
+        .eq("account_type", account_type)
+        .order("timestamp", desc=True)
+        .limit(1)
+        .execute()
+    )
+
+    rows = response.data or []
+    if rows and rows[0].get("timestamp") is not None:
+        return int(rows[0]["timestamp"]) + 1
+    return None
 
 
 def sync_all_to_supabase():
@@ -176,6 +231,7 @@ def sync_all_to_supabase():
     participants = get_active_participants()
     total_orders = 0
     total_snapshots = 0
+    total_flows = 0
     failures = 0
 
     for participant in participants:
@@ -220,8 +276,17 @@ def sync_all_to_supabase():
                 failures += 1
                 log_fetch_error(participant_id, e, account_type)
 
+            try:
+                moved = sync_cash_flows(participant_id, credential, exchange)
+                total_flows += moved
+                if moved:
+                    print(f"{participant_id} ({account_type}): {moved} cash flow(s)")
+            except Exception as e:
+                failures += 1
+                log_fetch_error(participant_id, e, account_type)
+
     print(f"Done: {total_orders} orders upserted, {total_snapshots} snapshots "
-          f"recorded, {failures} credential(s) failed.")
+          f"recorded, {total_flows} cash flow(s), {failures} credential(s) failed.")
 
 
 if __name__ == "__main__":
