@@ -17,10 +17,7 @@ closed_order_test.csv
 participant_signups.csv
 portfolio_history.csv
 test.py
-sign_ups.py
 readfile.py
-bitmex_IGNORE.py
-supabase_test.py
 API_endpoints.py
 gen_fernet_key.py
 main.py

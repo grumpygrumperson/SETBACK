@@ -456,21 +456,40 @@ if __name__ == "__main__":
 
 def account_type_from_order(order: dict) -> str:
     """
-    Read the venue off an order rather than assuming it from whichever key
-    fetched it. Coinbase tags every order with `product_type`, and perps are
-    reported as futures carrying a perpetual expiry type.
+    Best-effort venue for an order, for callers that have no credential to
+    hand (closed_trades, ad hoc scripts).
 
-    Returns 'spot', 'perp', 'future', or None if Coinbase didn't say.
+    The sync does NOT rely on this - it stamps the credential's own venue,
+    which is authoritative because orders are fetched with a portfolio-scoped
+    key.
+
+    Coinbase is unhelpful here: INTX perpetuals come back as
+    product_type='FUTURE' with contract_expiry_type=None, indistinguishable
+    from a dated future by those fields alone. ccxt's unified symbol does
+    carry the distinction, so that's what decides it:
+
+        PUMP/USDC:USDC          perpetual swap  -> 'perp'
+        BTC/USD:USD-260327      dated future    -> 'future'
+
+    Returns 'spot', 'perp', 'future', or None if nothing identifies it.
     """
     info = order.get('info') or {}
     product_type = (info.get('product_type') or '').upper()
 
     if product_type == 'SPOT':
         return 'spot'
+
     if product_type in ('FUTURE', 'PERPETUAL'):
         expiry_type = (info.get('contract_expiry_type') or '').upper()
         if product_type == 'PERPETUAL' or 'PERPETUAL' in expiry_type:
             return 'perp'
+
+        # Fall back to the unified symbol: a settle suffix with no expiry
+        # date is ccxt's notation for a perpetual swap.
+        symbol = order.get('symbol') or ''
+        if ':' in symbol:
+            return 'future' if '-' in symbol.split(':', 1)[1] else 'perp'
+
         return 'future'
 
     return product_type.lower() or None

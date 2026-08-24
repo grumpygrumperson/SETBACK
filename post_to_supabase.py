@@ -118,13 +118,14 @@ def sync_orders(participant_id, credential: dict, exchange) -> int:
 
     for order in orders:
         order["participant_id"] = participant_id
-        # closed_orders reads account_type off each order's product_type, but
-        # falls back to None if Coinbase didn't report one. A null here would
-        # defeat the (participant_id, account_type, order_id) constraint -
-        # Postgres treats nulls as distinct - and re-insert duplicates every
-        # run, so fall back to the venue the credential belongs to.
-        if not order.get("account_type"):
-            order["account_type"] = account_type
+        # The CREDENTIAL is authoritative, not the order's product_type.
+        # Orders are fetched with a portfolio-scoped key, so they can only
+        # come from that venue - whereas Coinbase labels INTX perpetuals
+        # 'FUTURE' with no contract_expiry_type, which reads as a dated
+        # future. Storing them under a different account_type than the one
+        # get_last_synced_timestamp() queries makes the resume point invisible
+        # and re-fetches the whole history every run.
+        order["account_type"] = account_type
 
     response = supabase.table("trade_metrics").upsert(
         orders,

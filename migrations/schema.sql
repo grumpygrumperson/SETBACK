@@ -49,7 +49,7 @@ create table if not exists public.participant_api_keys (
   id             bigint generated always as identity primary key,
   participant_id uuid not null references public.participants(id) on delete cascade,
   exchange       text not null,               -- ccxt id, e.g. 'coinbase'
-  account_type   text not null,               -- 'spot' | 'perp' | 'future'
+  account_type   text not null,               -- 'spot' | 'perp'
   api_key        text not null,               -- Fernet encrypted
   api_secret     text not null,               -- Fernet encrypted
   api_passphrase text,                        -- Fernet encrypted; some venues only
@@ -61,8 +61,31 @@ create table if not exists public.participant_api_keys (
     unique (participant_id, exchange, account_type),
 
   constraint participant_api_keys_account_type_check
-    check (account_type in ('spot', 'perp', 'future'))
+    check (account_type in ('spot', 'perp'))
 );
+
+-- account_type is restricted to what the code actually HANDLES, not to every
+-- venue Coinbase can name. get_account_totals_usdc() dispatches perp vs. spot
+-- and nothing else; latest_balances sums only those two, so a 'future' row
+-- would be silently absent from the leaderboard total.
+--
+-- The narrowness is the point. Coinbase reports INTX perpetuals as
+-- product_type='FUTURE' with contract_expiry_type=null, so a naive classifier
+-- stores them as 'future' - which then makes the resume-point lookup in
+-- get_last_synced_timestamp(pid, 'perp') find nothing and re-fetch the entire
+-- order history on every run. Silent, and permanent. A constraint that
+-- ALLOWED 'future' would not have caught that; this one turns it into an
+-- immediate insert error.
+--
+-- Inline constraints are a no-op on a table that already exists, so the
+-- drop/add below is what actually repairs an older database. The add
+-- revalidates every existing row, which is the intended behaviour: it should
+-- refuse rather than accept rows the sync can't process.
+alter table public.participant_api_keys
+  drop constraint if exists participant_api_keys_account_type_check;
+alter table public.participant_api_keys
+  add constraint participant_api_keys_account_type_check
+  check (account_type in ('spot', 'perp'));
 
 
 -- ---------------------------------------------------------------------------
@@ -116,6 +139,17 @@ begin
   end if;
 end $$;
 
+-- Same vocabulary as participant_api_keys. Orders are fetched with a
+-- portfolio-scoped key, so sync_orders() stamps the CREDENTIAL's venue rather
+-- than trusting the order's own product_type; this constraint is what makes a
+-- regression back to the order-derived value fail loudly instead of quietly
+-- orphaning the resume point.
+alter table public.trade_metrics
+  drop constraint if exists trade_metrics_account_type_check;
+alter table public.trade_metrics
+  add constraint trade_metrics_account_type_check
+  check (account_type in ('spot', 'perp'));
+
 
 -- ---------------------------------------------------------------------------
 -- 4. Balance snapshots — the equity curve
@@ -164,6 +198,15 @@ begin
       unique (participant_id, account_type, timestamp);
   end if;
 end $$;
+
+-- Matters most here: latest_balances sums only 'spot' and 'perp', so a
+-- snapshot stored under any other venue would be dropped from the leaderboard
+-- total without any error to say so.
+alter table public.balance_snapshots
+  drop constraint if exists balance_snapshots_account_type_check;
+alter table public.balance_snapshots
+  add constraint balance_snapshots_account_type_check
+  check (account_type in ('spot', 'perp'));
 
 
 -- ---------------------------------------------------------------------------
@@ -229,6 +272,16 @@ create table if not exists public.cash_flows (
 -- ever wrote. Dropped here so a database created from that version converges
 -- on the same schema; no-op on a fresh one.
 alter table public.cash_flows drop column if exists is_internal;
+
+-- Same vocabulary again. metrics.mark_internal_transfers() pairs a
+-- participant's flows across their venues; a third venue label it doesn't
+-- expect would leave those transfers unmatched and counted as external
+-- funding, distorting every return.
+alter table public.cash_flows
+  drop constraint if exists cash_flows_account_type_check;
+alter table public.cash_flows
+  add constraint cash_flows_account_type_check
+  check (account_type in ('spot', 'perp'));
 
 
 -- ---------------------------------------------------------------------------

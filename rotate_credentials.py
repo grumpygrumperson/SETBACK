@@ -23,6 +23,7 @@ from dotenv import load_dotenv
 from supabase import create_client
 
 from coinbase import _get_fernet
+from cryptography.fernet import Fernet, InvalidToken
 
 load_dotenv()
 
@@ -91,7 +92,6 @@ def verify_current_key_only() -> None:
     that haven't been rotated and the rotation would look complete when it
     isn't.
     """
-    from cryptography.fernet import Fernet, InvalidToken
 
     current = Fernet(os.getenv("FERNET_KEY").strip().encode())
     rows = supabase.table("participant_api_keys").select(
