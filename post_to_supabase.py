@@ -1,10 +1,14 @@
+import logging
 import os
+import sys
 from supabase import create_client
 from dotenv import load_dotenv
 from coinbase import (build_exchange, closed_orders, get_account_totals_usdc,
                       get_cash_flows)
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 
 def _require_env(*names: str) -> None:
@@ -91,7 +95,7 @@ def log_fetch_error(participant_id, error: Exception, account_type: str = None) 
     appearing with nothing but stdout to say why.
     """
     label = f"{participant_id} ({account_type})" if account_type else str(participant_id)
-    print(f"Failed to sync {label}. Error: {error}")
+    logger.error("Failed to sync %s: %s", label, error)
     try:
         supabase.table("fetch_errors").insert({
             "participant_id": participant_id,
@@ -99,7 +103,7 @@ def log_fetch_error(participant_id, error: Exception, account_type: str = None) 
         }).execute()
     except Exception as e:
         # Never let error logging take down the run for everyone else
-        print(f"Could not record fetch error for {label}: {e}")
+        logger.error("Could not record fetch error for %s: %s", label, e)
 
 
 def sync_orders(participant_id, credential: dict, exchange) -> int:
@@ -228,6 +232,10 @@ def sync_all_to_supabase():
     Each credential is handled independently: a participant's expired perp key
     shouldn't cost them their spot sync, and no single participant's failure
     should cost everyone else their run.
+
+    Returns the number of failures so the caller can set an exit code. The run
+    completing is not the same as the run working, and on a scheduled host the
+    exit code is the only signal anything watches.
     """
     participants = get_active_participants()
     total_orders = 0
@@ -264,7 +272,7 @@ def sync_all_to_supabase():
             try:
                 written = sync_orders(participant_id, credential, exchange)
                 total_orders += written
-                print(f"{participant_id} ({account_type}): {written} orders")
+                logger.info("%s (%s): %d orders", participant_id, account_type, written)
             except Exception as e:
                 failures += 1
                 log_fetch_error(participant_id, e, account_type)
@@ -272,7 +280,7 @@ def sync_all_to_supabase():
             try:
                 sync_balance_snapshot(participant_id, credential, exchange)
                 total_snapshots += 1
-                print(f"{participant_id} ({account_type}): snapshot recorded")
+                logger.info("%s (%s): snapshot recorded", participant_id, account_type)
             except Exception as e:
                 failures += 1
                 log_fetch_error(participant_id, e, account_type)
@@ -281,14 +289,41 @@ def sync_all_to_supabase():
                 moved = sync_cash_flows(participant_id, credential, exchange)
                 total_flows += moved
                 if moved:
-                    print(f"{participant_id} ({account_type}): {moved} cash flow(s)")
+                    logger.info("%s (%s): %d cash flow(s)",
+                                participant_id, account_type, moved)
             except Exception as e:
                 failures += 1
                 log_fetch_error(participant_id, e, account_type)
 
-    print(f"Done: {total_orders} orders upserted, {total_snapshots} snapshots "
-          f"recorded, {total_flows} cash flow(s), {failures} credential(s) failed.")
+    logger.info("Done: %d orders upserted, %d snapshots recorded, %d cash "
+                "flow(s), %d credential(s) failed.",
+                total_orders, total_snapshots, total_flows, failures)
+
+    return failures
 
 
 if __name__ == "__main__":
-    sync_all_to_supabase()
+    # Configure logging HERE, not at import: a library that configures the
+    # root logger on import hijacks the settings of anything that imports it.
+    # The entrypoint owns this decision.
+    #
+    # Level defaults to INFO so the operational lines are visible; set
+    # LOG_LEVEL=DEBUG to include the per-symbol pricing detail from coinbase.
+    logging.basicConfig(
+        level=os.getenv("LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)-7s %(name)s | %(message)s",
+        stream=sys.stdout,
+    )
+    # httpx logs every Supabase call at INFO - two lines per participant per
+    # venue, which buries the sync's own output. Warnings still come through.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
+    failures = sync_all_to_supabase()
+
+    # Exit non-zero when anything failed. Without this the process always
+    # reports success, so a sync that has silently stopped working for every
+    # participant looks identical to a healthy one - and nothing the host
+    # offers (alerts, retries, run history) can tell them apart.
+    if failures:
+        logger.error("Exiting non-zero: %d credential(s) failed", failures)
+        sys.exit(1)

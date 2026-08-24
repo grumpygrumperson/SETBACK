@@ -11,3 +11,13 @@ dependencies = [
     "supabase>=2.31.0",
     "cryptography>=48.0.1"
 ]
+
+# Test-only. Kept out of `dependencies` so the Railway build stays lean -
+# the deploy runs `uv sync --no-dev` and never installs these.
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

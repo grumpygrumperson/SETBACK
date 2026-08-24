@@ -6,15 +6,18 @@ touching an exchange, and so metrics can be recomputed over stored history
 without re-fetching anything.
 """
 
+import logging
 import math
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from statistics import mean, stdev
 
 from dotenv import load_dotenv
 from supabase import create_client
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 
 def _require_env(*names: str) -> None:
@@ -46,6 +49,27 @@ PERIODS_PER_YEAR = {
     "daily": 365,
     "hourly": 24 * 365,
 }
+
+# How a period is labelled, and how long one lasts. Kept beside
+# PERIODS_PER_YEAR so adding a period means editing one region, not three.
+_PERIOD_FORMATS = {
+    "daily": "%Y-%m-%d",
+    "hourly": "%Y-%m-%dT%H",
+}
+_PERIOD_STEPS = {
+    "daily": timedelta(days=1),
+    "hourly": timedelta(hours=1),
+}
+
+# Ceiling on how long one participant's history may span, as a multiple of a
+# year. Exists to turn a bad timestamp into a readable error rather than a
+# silently enormous series: a snapshot stored in SECONDS rather than
+# milliseconds parses as 1970.
+#
+# Expressed in YEARS rather than as a flat row count so it catches the daily
+# case too - 1970 to now is only ~20,500 days, which any fixed cap large
+# enough for hourly data would wave straight through.
+_MAX_YEARS = 5
 
 
 def fetch_snapshots(participant_id: str) -> list[dict]:
@@ -140,20 +164,62 @@ def _period_key(timestamp_ms: int, period: str) -> str:
     """
     Bucket an exchange millisecond timestamp into a period label (UTC).
     """
+    if period not in _PERIOD_FORMATS:
+        raise ValueError(
+            f"Unknown period '{period}' - expected one of {sorted(_PERIOD_FORMATS)}"
+        )
     dt = datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc)
-    if period == "daily":
-        return dt.strftime("%Y-%m-%d")
-    if period == "hourly":
-        return dt.strftime("%Y-%m-%dT%H")
-    raise ValueError(f"Unknown period '{period}' - expected one of {sorted(PERIODS_PER_YEAR)}")
+    return dt.strftime(_PERIOD_FORMATS[period])
+
+
+def _period_range(first_key: str, last_key: str, period: str) -> list[str]:
+    """
+    Every period label from `first_key` to `last_key` inclusive - including the
+    ones with no data.
+
+    This is the fix for a bug that quietly inflated Sharpe ratios. The series
+    used to be built from the periods that HAPPENED to have snapshots, so a
+    sync outage was invisible: five missing days collapsed into a single
+    adjacent pair, and the whole five-day move was then treated as one daily
+    return and annualised by sqrt(365). The participants with the least
+    reliable sync got the most distorted scores.
+
+    Enumerating the calendar instead means a gap stays a gap, and callers can
+    decide what to do about it rather than never learning it was there.
+    """
+    if period not in _PERIOD_STEPS:
+        raise ValueError(
+            f"Unknown period '{period}' - expected one of {sorted(_PERIOD_STEPS)}"
+        )
+
+    fmt, step = _PERIOD_FORMATS[period], _PERIOD_STEPS[period]
+    current = datetime.strptime(first_key, fmt).replace(tzinfo=timezone.utc)
+    end = datetime.strptime(last_key, fmt).replace(tzinfo=timezone.utc)
+
+    limit = _MAX_YEARS * PERIODS_PER_YEAR[period]
+    keys = []
+    while current <= end:
+        keys.append(current.strftime(fmt))
+        if len(keys) > limit:
+            raise ValueError(
+                f"Refusing to build a {period} axis spanning more than "
+                f"{_MAX_YEARS} years ({first_key} to {last_key}). A snapshot "
+                f"timestamp is almost certainly wrong - "
+                f"balance_snapshots.timestamp is in MILLISECONDS, and a value "
+                f"stored in seconds parses as 1970."
+            )
+        current += step
+
+    return keys
 
 
 def build_portfolio_series(snapshots: list[dict], period: str = "daily",
-                           max_stale_periods: int = 3) -> tuple[list[tuple[str, float]], dict[str, float]]:
+                           max_stale_periods: int = 3) -> tuple[list[tuple[str, float | None]], dict[str, float]]:
     """
-    Collapse per-venue snapshots into one portfolio value per period.
+    Collapse per-venue snapshots into one portfolio value per period, over a
+    CONTIGUOUS calendar axis.
 
-    Three things this has to get right:
+    Four things this has to get right:
 
     1. Spot and perp are ONE competition but are written seconds apart, under
        different timestamps. They're bucketed into the same period and summed,
@@ -167,14 +233,30 @@ def build_portfolio_series(snapshots: list[dict], period: str = "daily",
        be carried forever, or the participant keeps credit for money they no
        longer have. After `max_stale_periods` it's dropped.
 
-    Dropping is itself a trap: the portfolio value falls, which looks like a
-    catastrophic loss. So each dropped venue is also reported as a negative
-    structural adjustment, to be applied like a withdrawal - the money left
-    the competition, it wasn't lost trading.
+       Dropping is itself a trap: the portfolio value falls, which looks like
+       a catastrophic loss. So each dropped venue is also reported as a
+       negative structural adjustment, to be applied like a withdrawal - the
+       money left the competition, it wasn't lost trading.
+
+    4. A period where NO venue reported is a hole in the record, not a
+       datapoint. It's emitted as None rather than skipped, because skipping
+       it makes the surrounding periods look adjacent: five missing days would
+       collapse into one pair, and the entire five-day move would be scored as
+       a single daily return. period_returns() drops any return touching a
+       None instead of inventing one.
+
+       Note the difference from case 2: there, at least one venue reported, so
+       the total is knowable and the missing venue is carried. Here nothing
+       reported and the total is genuinely unknown.
+
+    Staleness in case 3 is now counted in CALENDAR periods too - previously it
+    counted only periods that had data, so a venue could never be detected as
+    stale during a total outage.
 
     Returns (series, adjustments) where series is
-    [(period_label, total_usdc), ...] chronologically and adjustments maps
-    period_label -> signed value removed.
+    [(period_label, total_usdc_or_None), ...] over every period from the first
+    snapshot to the last, and adjustments maps period_label -> signed value
+    removed.
     """
     # last snapshot per (period, venue)
     by_period: dict[str, dict[str, float]] = {}
@@ -185,17 +267,25 @@ def build_portfolio_series(snapshots: list[dict], period: str = "daily",
         key = _period_key(snap["timestamp"], period)
         by_period.setdefault(key, {})[snap["account_type"]] = float(value)
 
-    keys = sorted(by_period)
-    series: list[tuple[str, float]] = []
+    if not by_period:
+        return [], {}
+
+    observed = sorted(by_period)
+    keys = _period_range(observed[0], observed[-1], period)
+
+    series: list[tuple[str, float | None]] = []
     adjustments: dict[str, float] = {}
 
     carried: dict[str, float] = {}          # venue -> last known value
-    last_seen: dict[str, int] = {}          # venue -> index of its last snapshot
+    last_seen: dict[str, int] = {}          # venue -> calendar index last seen
 
     for index, key in enumerate(keys):
-        for venue, value in by_period[key].items():
-            carried[venue] = value
-            last_seen[venue] = index
+        present = by_period.get(key)
+
+        if present:
+            for venue, value in present.items():
+                carried[venue] = value
+                last_seen[venue] = index
 
         stale = [v for v in carried if index - last_seen[v] > max_stale_periods]
         for venue in stale:
@@ -203,12 +293,21 @@ def build_portfolio_series(snapshots: list[dict], period: str = "daily",
             adjustments[key] = adjustments.get(key, 0.0) - carried.pop(venue)
             last_seen.pop(venue, None)
 
-        series.append((key, sum(carried.values())))
+        # None when nothing reported: the total is unknown, not zero and not
+        # unchanged. See point 4 above.
+        series.append((key, sum(carried.values()) if present else None))
+
+    gaps = sum(1 for _, value in series if value is None)
+    if gaps:
+        logger.info(
+            "%d of %d %s periods have no snapshot from any venue - returns "
+            "spanning them are excluded", gaps, len(series), period
+        )
 
     return series, adjustments
 
 
-def period_returns(series: list[tuple[str, float]],
+def period_returns(series: list[tuple[str, float | None]],
                    flows: dict[str, float] = None) -> list[float]:
     """
     Simple returns between consecutive periods, adjusted for external flows.
@@ -224,11 +323,23 @@ def period_returns(series: list[tuple[str, float]],
     error from that assumption is small; a mid-period deposit that was then
     traded gets slightly misattributed, which is the standard trade-off in
     time-weighted return.
+
+    A None endpoint means that period has no snapshot from any venue, so no
+    return is produced for either pair touching it. Every return in the result
+    therefore spans exactly ONE period, which is what makes the sqrt(N)
+    annualisation in sharpe_from_returns valid.
+
+    Dropping is deliberate rather than computing the multi-period return and
+    scaling it: a return over an unknown number of periods can't be annualised
+    without assuming how the move was distributed across them, and that
+    assumption is exactly what the missing data can't support.
     """
     flows = flows or {}
     returns = []
 
     for (_, start), (end_key, end) in zip(series, series[1:]):
+        if start is None or end is None:
+            continue                        # gap in the record; see docstring
         if start <= 0:
             continue                        # undefined; skip rather than divide by zero
         net_flow = flows.get(end_key, 0.0)
@@ -325,10 +436,14 @@ def participant_sharpe(participant_id: str, period: str = "daily",
     flows = mark_internal_transfers(fetch_cash_flows(participant_id))
     external = flows_by_period(flows, period)
 
-    if len(series) < 3:
+    # Count periods that actually have data. len(series) is now the calendar
+    # span, which a single snapshot on either side of a long outage would
+    # inflate past this check while yielding no usable returns at all.
+    observed = sum(1 for _, value in series if value is not None)
+    if observed < 3:
         raise ValueError(
             f"Need at least 3 {period} portfolio values to compute a Sharpe "
-            f"ratio, got {len(series)}"
+            f"ratio, got {observed} across {len(series)} {period} period(s)"
         )
 
     # Dropped venues behave exactly like withdrawals, so they're merged into
@@ -347,18 +462,35 @@ def participant_sharpe(participant_id: str, period: str = "daily",
     result["internal_transfers"] = sum(1 for f in flows if f.get("is_internal"))
     result["dropped_venue_usdc"] = sum(adjustments.values())
 
+    # Reported, not hidden: a participant scored on 8 of 30 days is a data
+    # quality problem, and the number is the only way a reader can tell that
+    # from a participant who simply joined late.
+    result["calendar_periods"] = len(series)
+    result["observed_periods"] = observed
+    result["gap_periods"] = len(series) - observed
+
     # A Sharpe ratio over a handful of days is noise, not signal. Say so in
-    # the result rather than leaving the caller to know it.
+    # the result rather than leaving the caller to know it. Gaps count against
+    # it too - `periods` is now the number of single-period returns that
+    # survived, so an outage lowers this rather than silently compressing.
     result["reliable"] = result["periods"] >= 20
 
     return result
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=os.getenv("LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)-7s %(name)s | %(message)s",
+    )
     for p in supabase.table("participants").select("id,display_name").execute().data:
         try:
             r = participant_sharpe(p["id"])
-            print(f"{p['display_name']:8} sharpe={r['sharpe']:.3f}  "
-                  f"({r['periods']} daily returns, {r['first']} to {r['last']})")
+            # sharpe is None whenever the volatility guard fires - formatting
+            # that with :.3f raises TypeError, so branch rather than assume.
+            score = f"{r['sharpe']:.3f}" if r["sharpe"] is not None else f"n/a ({r['reason']})"
+            gaps = f", {r['gap_periods']} gap period(s)" if r["gap_periods"] else ""
+            print(f"{p['display_name']:8} sharpe={score}  "
+                  f"({r['periods']} daily returns, {r['first']} to {r['last']}{gaps})")
         except ValueError as e:
             print(f"{p['display_name']:8} not enough history: {e}")

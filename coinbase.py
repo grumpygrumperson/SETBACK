@@ -7,6 +7,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
 # Your own keys, by venue. Coinbase issues separate credentials for spot and
 # perps, so each venue reads its own pair. Participants' keys never come from
 # here - those are decrypted out of Supabase by build_exchange().
@@ -20,7 +22,14 @@ ENV_CREDENTIALS = {
 # else depends on. To test another participant's keys ad hoc, pass them
 # straight to build_exchange(key, secret, encrypted=False).
 
-# Stablecoins and fiat-pegged currencies treated as 1:1 with USD
+# Stablecoins and fiat-pegged currencies treated as 1:1 with USD.
+#
+# Defined ONCE, for the same reason as COMPETITION_START below. These used to
+# be re-declared inside price_balances_in_usdc and get_account_totals_usdc,
+# which shadowed this set: adding a stablecoin here changed how a historical
+# transfer was valued (_price_at_usdc reads this one) but not how a live
+# balance was, so the same coin could be worth $1 in one calculation and a
+# ticker lookup in another.
 USD_EQUIVALENTS = {
     'USDC', 'USDT', 'USD', 'BUSD', 'DAI', 'TUSD', 'USDP', 'GUSD',
     'FDUSD', 'USDD', 'FRAX', 'LUSD', 'SUSD', 'USDN', 'USDJ', 'MAMUSD',
@@ -185,14 +194,6 @@ def price_balances_in_usdc(exchange: ccxt.Exchange, balances: dict = None, price
     (i.e. exchange.fetch_balance() with no type override) and prices that.
     """
 
-    logger = logging.getLogger(__name__)
-
-    USD_EQUIVALENTS = {
-            'USDC', 'USDT', 'USD', 'BUSD', 'DAI', 'TUSD', 'USDP', 'GUSD',
-            'FDUSD', 'USDD', 'FRAX', 'LUSD', 'SUSD', 'USDN', 'USDJ', 'MAMUSD',
-        }
-    QUOTE_PRIORITY = ['USDC', 'USDT', 'USD', 'BUSD', 'FDUSD']
-
     if price_cache is None:
         price_cache = {}
 
@@ -270,8 +271,6 @@ def find_perp_portfolio_uuid(exchange: ccxt.Exchange) -> str:
     Returns None if the credentials can't see a perp portfolio, which is the
     normal answer for a spot-only key.
     """
-    logger = logging.getLogger(__name__)
-
     portfolios = exchange.fetch_portfolios()
 
     # Match on TYPE, not name. A user can call any portfolio anything - one
@@ -316,8 +315,6 @@ def get_perp_account_value(exchange: ccxt.Exchange, portfolio_uuid: str = None) 
     exchange.fetch_positions() separately - this endpoint only reports
     portfolio-level aggregates.
     """
-    logger = logging.getLogger(__name__)
-
     timestamp = exchange.milliseconds()
 
     if not portfolio_uuid:
@@ -387,16 +384,9 @@ def get_account_totals_usdc(exchange: ccxt.Exchange, account_type: str = 'spot',
     {'timestamp': 1783159194622, 'datetime': '2026-07-04T09:59:54.622Z',
      'account_type': 'spot', 'total_usdc': 129.18400834, 'spot_total_usdc': 129.18400834}
     """
-    logger = logging.getLogger(__name__)
-
     if account_type == 'perp':
         return get_perp_account_value(exchange, portfolio_uuid)
 
-    USD_EQUIVALENTS = {
-        'USDC', 'USDT', 'USD', 'BUSD', 'DAI', 'TUSD', 'USDP', 'GUSD',
-        'FDUSD', 'USDD', 'FRAX', 'LUSD', 'SUSD', 'USDN', 'USDJ', 'MAMUSD',
-    }
-    QUOTE_PRIORITY = ['USDC', 'USDT', 'USD', 'BUSD', 'FDUSD']
     # Only ask for wallet types the exchange actually has. Coinbase has no
     # options product, and 'future' resolves to the CFM (US futures) balance
     # endpoint, which PERMISSION_DENIEDs for every spot-only key - two
@@ -513,8 +503,6 @@ def closed_orders(exchange: ccxt.Exchange, symbol: str = None, since=None, limit
     the Advanced Trade API answers for the key's default portfolio only, so a
     participant's perp orders would be silently missing.
     """
-    logger = logging.getLogger(__name__)
-
     request_params = {}
     if portfolio_uuid:
         request_params['retail_portfolio_id'] = portfolio_uuid
@@ -650,8 +638,6 @@ def _price_at_usdc(exchange: ccxt.Exchange, coin: str, timestamp_ms: int,
     Falls back to the current ticker only if no historical candle is
     available, and says so in the log.
     """
-    logger = logging.getLogger(__name__)
-
     if coin in USD_EQUIVALENTS:
         return 1.0
 
@@ -746,7 +732,6 @@ def _transfer_currencies(exchange: ccxt.Exchange) -> list[str]:
     The trade-off: a deposit of a coin that was later fully sold won't be
     seen, because it no longer shows in the balance.
     """
-    logger = logging.getLogger(__name__)
     codes = {'USD', 'USDC'}
 
     try:
@@ -774,8 +759,6 @@ def _paginate_transfers(exchange: ccxt.Exchange, code: str, since: int,
     Mirrors the pagination in closed_orders: advance past the newest entry
     seen, since ccxt sorts these ascending by timestamp.
     """
-    logger = logging.getLogger(__name__)
-
     entries = []
     cursor = since
     seen_ids = set()
@@ -819,8 +802,6 @@ def get_cash_flows(exchange: ccxt.Exchange, since=None, limit: int = 100) -> lis
 
     `since` accepts milliseconds or an ISO8601 string, matching closed_orders.
     """
-    logger = logging.getLogger(__name__)
-
     if since is None:
         since = exchange.parse8601(COMPETITION_START)
     elif isinstance(since, str):
