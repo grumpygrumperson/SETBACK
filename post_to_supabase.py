@@ -225,7 +225,66 @@ def get_last_flow_timestamp(participant_id, account_type: str) -> int:
     return None
 
 
-def sync_all_to_supabase():
+def exit_code_for(attempted: int, failed: int, threshold: float = 1.0) -> int:
+    """
+    Decide whether a run counts as a failure, given how many credentials were
+    tried and how many produced nothing.
+
+    The distinction this draws is between a PARTICIPANT's problem and an
+    OPERATOR's problem:
+
+      one credential fails    that participant revoked their key. It's already
+                              in fetch_errors and is fixed by emailing them.
+                              Failing the run for it means that once anyone
+                              abandons the competition, every run is red
+                              forever - and a permanently red job is one
+                              nobody looks at, which costs you the alerting
+                              the exit code existed to provide.
+
+      every credential fails  wrong FERNET_KEY, Supabase unreachable, the
+                              exchange down. Nothing will fix itself and the
+                              run should be loud.
+
+    `threshold` is the failure FRACTION at or above which the run fails:
+
+        1.0   (default) only a total wipeout is an error
+        0.5   half the field broken is an error
+        0.0   any failure at all is an error
+
+    A run with zero failures is never an error, whatever the threshold.
+    A run that attempted nothing always is - an empty participants table
+    means registration is broken, and reporting success for having done
+    nothing is how that goes unnoticed.
+    """
+    if attempted == 0:
+        return 1
+    if failed == 0:
+        return 0
+    return 1 if (failed / attempted) >= threshold else 0
+
+
+def _failure_threshold() -> float:
+    """
+    Read SYNC_FAILURE_THRESHOLD, falling back to 1.0 on anything unusable.
+
+    A malformed value must not take down the run: the sync working matters
+    more than the alerting policy being exactly right.
+    """
+    raw = os.getenv("SYNC_FAILURE_THRESHOLD")
+    if not raw:
+        return 1.0
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("SYNC_FAILURE_THRESHOLD=%r is not a number - using 1.0", raw)
+        return 1.0
+    if not 0.0 <= value <= 1.0:
+        logger.warning("SYNC_FAILURE_THRESHOLD=%s is outside 0.0-1.0 - using 1.0", value)
+        return 1.0
+    return value
+
+
+def sync_all_to_supabase() -> dict:
     """
     For every participant, sync every venue they've registered.
 
@@ -233,15 +292,26 @@ def sync_all_to_supabase():
     shouldn't cost them their spot sync, and no single participant's failure
     should cost everyone else their run.
 
-    Returns the number of failures so the caller can set an exit code. The run
-    completing is not the same as the run working, and on a scheduled host the
-    exit code is the only signal anything watches.
+    Returns a summary the caller uses to set an exit code. The run completing
+    is not the same as the run working, and on a scheduled host the exit code
+    is the only signal anything watches.
+
+    A credential counts as FAILED when it produced no balance snapshot.
+    That's the line because the snapshot is the only datum that can't be
+    recovered later: orders and cash flows resume from their stored
+    timestamps on the next run, but the equity curve point for 12:15 is gone
+    for good. A credential whose orders failed while its snapshot succeeded
+    has lost nothing permanent, so it doesn't count against the threshold -
+    the error is still logged and still in fetch_errors either way.
     """
     participants = get_active_participants()
     total_orders = 0
     total_snapshots = 0
     total_flows = 0
-    failures = 0
+    task_failures = 0        # every failed step, for reporting
+    attempted = 0            # credentials we had keys for
+    failed = 0               # credentials that produced no snapshot
+    skipped = 0              # rows with no key stored at all
 
     for participant in participants:
         participant_id = participant.get("id")
@@ -250,7 +320,14 @@ def sync_all_to_supabase():
             account_type = credential.get("account_type")
 
             if not credential.get("api_key") or not credential.get("api_secret"):
+                # A registration problem rather than a sync failure, but not
+                # silent either - an active row with no key never syncs.
+                skipped += 1
+                logger.warning("%s (%s): active credential row has no key stored",
+                               participant_id, account_type)
                 continue
+
+            attempted += 1
 
             try:
                 exchange = build_exchange(
@@ -262,7 +339,8 @@ def sync_all_to_supabase():
                 )
             except Exception as e:
                 # Can't build the client - nothing else is possible for this row
-                failures += 1
+                task_failures += 1
+                failed += 1
                 log_fetch_error(participant_id, e, account_type)
                 continue
 
@@ -274,7 +352,7 @@ def sync_all_to_supabase():
                 total_orders += written
                 logger.info("%s (%s): %d orders", participant_id, account_type, written)
             except Exception as e:
-                failures += 1
+                task_failures += 1
                 log_fetch_error(participant_id, e, account_type)
 
             try:
@@ -282,7 +360,9 @@ def sync_all_to_supabase():
                 total_snapshots += 1
                 logger.info("%s (%s): snapshot recorded", participant_id, account_type)
             except Exception as e:
-                failures += 1
+                # The unrecoverable one - see the docstring.
+                task_failures += 1
+                failed += 1
                 log_fetch_error(participant_id, e, account_type)
 
             try:
@@ -292,14 +372,24 @@ def sync_all_to_supabase():
                     logger.info("%s (%s): %d cash flow(s)",
                                 participant_id, account_type, moved)
             except Exception as e:
-                failures += 1
+                task_failures += 1
                 log_fetch_error(participant_id, e, account_type)
 
     logger.info("Done: %d orders upserted, %d snapshots recorded, %d cash "
-                "flow(s), %d credential(s) failed.",
-                total_orders, total_snapshots, total_flows, failures)
+                "flow(s). %d of %d credential(s) failed, %d step(s) failed in "
+                "total, %d row(s) skipped for having no key.",
+                total_orders, total_snapshots, total_flows,
+                failed, attempted, task_failures, skipped)
 
-    return failures
+    return {
+        "attempted": attempted,
+        "failed": failed,
+        "task_failures": task_failures,
+        "skipped": skipped,
+        "orders": total_orders,
+        "snapshots": total_snapshots,
+        "flows": total_flows,
+    }
 
 
 if __name__ == "__main__":
@@ -318,12 +408,29 @@ if __name__ == "__main__":
     # venue, which buries the sync's own output. Warnings still come through.
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
-    failures = sync_all_to_supabase()
+    summary = sync_all_to_supabase()
 
-    # Exit non-zero when anything failed. Without this the process always
-    # reports success, so a sync that has silently stopped working for every
-    # participant looks identical to a healthy one - and nothing the host
-    # offers (alerts, retries, run history) can tell them apart.
-    if failures:
-        logger.error("Exiting non-zero: %d credential(s) failed", failures)
-        sys.exit(1)
+    # Without a non-zero exit the process always reports success, so a sync
+    # that has silently stopped working looks identical to a healthy one and
+    # nothing the host offers (alerts, retries, run history) can tell them
+    # apart. But failing on ANY error is just as useless in the other
+    # direction - see exit_code_for() for why.
+    threshold = _failure_threshold()
+    code = exit_code_for(summary["attempted"], summary["failed"], threshold)
+
+    if code:
+        if summary["attempted"] == 0:
+            logger.error("Exiting non-zero: no credentials to sync at all - "
+                         "check that participants and participant_api_keys "
+                         "are populated and is_active is set")
+        else:
+            logger.error("Exiting non-zero: %d of %d credential(s) produced no "
+                         "snapshot, at or above the %.0f%% threshold",
+                         summary["failed"], summary["attempted"], threshold * 100)
+    elif summary["failed"]:
+        logger.warning("%d of %d credential(s) failed, below the %.0f%% "
+                       "threshold - run still reported as successful. See "
+                       "fetch_errors for detail.",
+                       summary["failed"], summary["attempted"], threshold * 100)
+
+    sys.exit(code)
