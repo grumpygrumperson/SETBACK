@@ -49,7 +49,7 @@ QUOTE_PRIORITY = ['USDC', 'USDT', 'USD', 'BUSD', 'FDUSD']
 # redeploy - e.g. COMPETITION_START=2020-01-01T00:00:00Z to pull full history.
 COMPETITION_START = os.getenv("COMPETITION_START", "2026-01-01T00:00:00Z")
 
-_fernet: Fernet = None
+_fernet: MultiFernet | None = None
 
 
 def exchange_from_env(account_type: str = 'spot') -> ccxt.Exchange:
@@ -239,9 +239,6 @@ def price_balances_in_usdc(exchange: ccxt.Exchange, balances: dict = None, price
             logger.info("Skipped %s (%s): no convertible market found", coin, amount)
 
     return total_usdc_value
-
-if __name__ == "__main__":
-    print(price_balances_in_usdc(exchange_from_env('spot')))
 
 
 def _amount(field, default: float = 0.0) -> float:
@@ -437,11 +434,7 @@ def get_account_totals_usdc(exchange: ccxt.Exchange, account_type: str = 'spot',
         account_totals[f'{wallet_type}_total_usdc'] = wallet_total
         account_totals['total_usdc'] += wallet_total
 
-    return account_totals                
-
-if __name__ == "__main__":
-    print(get_account_totals_usdc(exchange_from_env('spot'), account_type='spot'))
-    print(get_account_totals_usdc(exchange_from_env('perp'), account_type='perp'))
+    return account_totals
 
 
 def account_type_from_order(order: dict) -> str:
@@ -486,6 +479,91 @@ def account_type_from_order(order: dict) -> str:
 
 
 
+def _resolve_since(exchange: ccxt.Exchange, since) -> int:
+    """
+    Normalise `since` to milliseconds.
+
+    Accepts a millisecond int (ccxt's convention, what the sync passes), an
+    ISO8601 string (convenient by hand), or None for COMPETITION_START.
+    """
+    if since is None:
+        since = exchange.parse8601(COMPETITION_START)
+    elif isinstance(since, str):
+        since = exchange.parse8601(since)
+
+    if since is None:
+        raise ValueError(
+            "since could not be resolved to a valid timestamp - pass "
+            "milliseconds (int) or a parseable ISO8601 string like "
+            "'2026-05-01T00:00:00Z'"
+        )
+    return since
+
+
+# A page walk can't safely be open-ended. If an exchange ignores `since` and
+# re-serves the same full page, the id guard below catches it - but only for
+# entries that HAVE ids. This is the backstop for the case where they don't.
+# At limit=200 this allows 200,000 records, far past any real participant.
+_MAX_PAGES = 1000
+
+
+def _paginate(fetch_page, since: int, limit: int, label: str) -> list[dict]:
+    """
+    Walk a paginated ccxt history endpoint to the end.
+
+    `fetch_page(since, limit)` returns one page of dicts carrying 'id' and
+    'timestamp'. Advances past the newest entry seen, since ccxt sorts these
+    ascending.
+
+    This exists because a truncated history fails SILENTLY: a short page and a
+    full page look identical to the caller, so a participant's first backfill
+    would simply stop at the cap and nobody would learn the rest was missing.
+    Orders, trades and transfers all had this shape, and only the transfer
+    path had the loop guard - now they share one implementation.
+    """
+    entries: list[dict] = []
+    cursor = since
+    seen_ids: set = set()
+    pages = 0
+
+    while True:
+        page = fetch_page(cursor, limit)
+        if not page:
+            break
+
+        # Only dedupe entries that have an id. Treating a missing id as a
+        # duplicate would break after the first page on any endpoint that
+        # doesn't set one.
+        fresh = [e for e in page
+                 if e.get('id') is None or e.get('id') not in seen_ids]
+        if not fresh:
+            break
+        seen_ids.update(e['id'] for e in page if e.get('id') is not None)
+        entries.extend(fresh)
+
+        if len(page) < limit:
+            break
+
+        pages += 1
+        if pages >= _MAX_PAGES:
+            logger.warning(
+                "Stopped paginating %s after %d pages - the exchange may be "
+                "ignoring `since`. History may be incomplete.", label, pages
+            )
+            break
+
+        last_ts = page[-1].get('timestamp')
+        if last_ts is None:
+            logger.warning(
+                "Last entry of a %s page has no timestamp, can't paginate "
+                "further - stopping. History may be incomplete.", label
+            )
+            break
+        cursor = last_ts + 1
+
+    return entries
+
+
 def closed_orders(exchange: ccxt.Exchange, symbol: str = None, since=None, limit: int = 200,
                   portfolio_uuid: str = None) -> list[dict]:
     """
@@ -507,33 +585,14 @@ def closed_orders(exchange: ccxt.Exchange, symbol: str = None, since=None, limit
     if portfolio_uuid:
         request_params['retail_portfolio_id'] = portfolio_uuid
 
-    if since is None:
-        since = exchange.parse8601(COMPETITION_START)
-    elif isinstance(since, str):
-        since = exchange.parse8601(since)
-
-    if since is None:
-        raise ValueError(
-            "since could not be resolved to a valid timestamp - pass milliseconds (int) "
-            "or a parseable ISO8601 string like '2026-05-01T00:00:00Z'"
-        )
+    since = _resolve_since(exchange, since)
 
     # symbol=None returns all symbols in one call on Coinbase
-    raw_orders = []
-    cursor = since
-    while True:
-        batch = exchange.fetch_closed_orders(symbol=symbol, since=cursor, limit=limit,
-                                             params=request_params)
-        if not batch:
-            break
-        raw_orders.extend(batch)
-        if len(batch) < limit:
-            break
-        last_ts = batch[-1].get('timestamp')
-        if last_ts is None:
-            logger.warning("Last order in page has no timestamp, can't paginate further - stopping")
-            break
-        cursor = last_ts + 1
+    raw_orders = _paginate(
+        lambda cursor, page_size: exchange.fetch_closed_orders(
+            symbol=symbol, since=cursor, limit=page_size, params=request_params),
+        since, limit, 'closed orders',
+    )
 
     clean_orders = []
 
@@ -588,40 +647,58 @@ def closed_orders(exchange: ccxt.Exchange, symbol: str = None, since=None, limit
 
 # print(closed_orders(exchange, symbol=None, since = '2026-05-01T00:00:00Z'))
 
-def closed_trades(exchange: ccxt.Exchange, symbol: str = None, since: str = None,
-                  portfolio_uuid: str = None) -> list:
-    if since:
-        since_ms = exchange.parse8601(since)
-    else:
-        since_ms = exchange.parse8601(COMPETITION_START)
+def closed_trades(exchange: ccxt.Exchange, symbol: str = None, since=None,
+                  limit: int = 200, portfolio_uuid: str = None) -> list[dict]:
+    """
+    Individual FILLS, as opposed to the orders that produced them.
 
+    NOT USED BY THE SYNC - trade_metrics stores orders. This is here for ad
+    hoc analysis where the distinction matters: one order can fill in many
+    pieces at different prices, so fills are what you want for slippage or
+    execution-quality work, and orders are what you want for counting trades.
+
+    `account_type` comes from account_type_from_order(), which is best-effort
+    (see its docstring). Anything writing these to the database should stamp
+    the credential's venue instead, the way sync_orders does.
+
+    Paginated and per-row guarded to match closed_orders. It previously had
+    neither, so it silently returned only the first page.
+    """
     request_params = {}
     if portfolio_uuid:
         request_params['retail_portfolio_id'] = portfolio_uuid
 
-    raw_trades = exchange.fetch_my_trades(symbol=symbol, since=since_ms, params=request_params)
+    since = _resolve_since(exchange, since)
+
+    raw_trades = _paginate(
+        lambda cursor, page_size: exchange.fetch_my_trades(
+            symbol=symbol, since=cursor, limit=page_size, params=request_params),
+        since, limit, 'trades',
+    )
 
     clean_trades = []
-    for order in raw_trades:
-        fee_info = order.get('fee') or {}
-        clean_trades.append({
-            'account_type': account_type_from_order(order),
-            'timestamp': order.get('timestamp'),
-            'datetime': order.get('datetime'),
-            'symbol': order.get('symbol'),
-            'type': order.get('type'),
-            'side': order.get('side'),
-            'price': order.get('price'),
-            'amount': order.get('amount'),
-            'fee_cost': fee_info.get('cost'),
-            'fee_currency': fee_info.get('currency'),
-            'order_id': order.get('order'),
-            'trade_id': order.get('id'),
-        })
-    return clean_trades
+    for trade in raw_trades:
+        try:
+            fee_info = trade.get('fee') or {}
+            clean_trades.append({
+                'account_type': account_type_from_order(trade),
+                'timestamp': trade.get('timestamp'),
+                'datetime': trade.get('datetime'),
+                'symbol': trade.get('symbol'),
+                'type': trade.get('type'),
+                'side': trade.get('side'),
+                'price': trade.get('price'),
+                'amount': trade.get('amount'),
+                'fee_cost': fee_info.get('cost'),
+                'fee_currency': fee_info.get('currency'),
+                'order_id': trade.get('order'),
+                'trade_id': trade.get('id'),
+            })
+        except Exception as e:
+            logger.warning("Skipping malformed trade %s: %s", trade.get('id'), e)
+            continue
 
-#print(closed_trades(exchange))
-#print(log_to_csv('closed_order_test.csv', closed_trades, exchange=exchange, since = '2026-05-01T00:00:00Z'))
+    return clean_trades
 
 
 
@@ -749,44 +826,17 @@ def _transfer_currencies(exchange: ccxt.Exchange) -> list[str]:
 def _paginate_transfers(exchange: ccxt.Exchange, code: str, since: int,
                         limit: int) -> list[dict]:
     """
-    Walk a full transfer history, one page at a time.
+    Walk a full transfer history for one currency.
 
-    Coinbase caps a page at 100. Without this, a participant's first backfill
-    would stop at the cap and silently drop the rest - and it fails silently,
-    because a short page and a full page look identical to the caller. Wrong
-    funding totals then feed straight into everyone's returns.
-
-    Mirrors the pagination in closed_orders: advance past the newest entry
-    seen, since ccxt sorts these ascending by timestamp.
+    Coinbase caps a page at 100, so without pagination a participant's first
+    backfill stops at the cap and silently drops the rest - wrong funding
+    totals then feed straight into everyone's returns.
     """
-    entries = []
-    cursor = since
-    seen_ids = set()
-
-    while True:
-        page = exchange.fetch_deposits_withdrawals(code=code, since=cursor, limit=limit)
-        if not page:
-            break
-
-        # Guard against an exchange that ignores `since` and re-serves the
-        # same page, which would otherwise loop forever.
-        fresh = [e for e in page if e.get('id') not in seen_ids]
-        if not fresh:
-            break
-        seen_ids.update(e.get('id') for e in fresh)
-        entries.extend(fresh)
-
-        if len(page) < limit:
-            break
-
-        last_ts = page[-1].get('timestamp')
-        if last_ts is None:
-            logger.warning("Transfer page has no timestamp on its last entry - "
-                           "stopping pagination for %s", code or 'account')
-            break
-        cursor = last_ts + 1
-
-    return entries
+    return _paginate(
+        lambda cursor, page_size: exchange.fetch_deposits_withdrawals(
+            code=code, since=cursor, limit=page_size),
+        since, limit, f"transfers ({code or 'account'})",
+    )
 
 
 def get_cash_flows(exchange: ccxt.Exchange, since=None, limit: int = 100) -> list[dict]:
@@ -802,10 +852,7 @@ def get_cash_flows(exchange: ccxt.Exchange, since=None, limit: int = 100) -> lis
 
     `since` accepts milliseconds or an ISO8601 string, matching closed_orders.
     """
-    if since is None:
-        since = exchange.parse8601(COMPETITION_START)
-    elif isinstance(since, str):
-        since = exchange.parse8601(since)
+    since = _resolve_since(exchange, since)
 
     try:
         raw = _paginate_transfers(exchange, None, since, limit)
@@ -875,3 +922,29 @@ def get_cash_flows(exchange: ccxt.Exchange, since=None, limit: int = 100) -> lis
             continue
 
     return flows
+
+
+if __name__ == "__main__":
+    # Ad hoc smoke test against YOUR OWN .env credentials. Never runs as part
+    # of the scheduled sync, which imports this module rather than executing
+    # it.
+    #
+    # One block, at the bottom. There used to be three, sitting between
+    # function definitions - each worked only because the functions it called
+    # happened to be defined above it, so adding a function in the wrong place
+    # would have broken them.
+    logging.basicConfig(
+        level=os.getenv("LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)-7s %(name)s | %(message)s",
+    )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
+    for venue in ('spot', 'perp'):
+        try:
+            exchange = exchange_from_env(venue)
+            totals = get_account_totals_usdc(exchange, account_type=venue)
+            orders = closed_orders(exchange)
+            print(f"{venue}: {totals['total_usdc']:.2f} USDC, {len(orders)} closed order(s)")
+        except Exception as e:
+            # Expected when only one venue's keys are in .env
+            print(f"{venue}: {type(e).__name__}: {e}")

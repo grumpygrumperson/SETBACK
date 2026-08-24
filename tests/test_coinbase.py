@@ -131,6 +131,143 @@ def test_the_two_sets_never_overlap():
 # Constants
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# _paginate
+#
+# All three history endpoints (orders, trades, transfers) now share this, so
+# a truncation bug here would silently shorten every participant's history.
+# ---------------------------------------------------------------------------
+
+def pages(*batches):
+    """A fetch_page callable that serves the given batches in order."""
+    served = list(batches)
+
+    def fetch(cursor, limit):
+        return served.pop(0) if served else []
+    return fetch
+
+
+def entry(entry_id, timestamp):
+    return {"id": entry_id, "timestamp": timestamp}
+
+
+def test_paginate_stops_on_a_short_page():
+    fetch = pages([entry("a", 1), entry("b", 2)])
+    assert len(coinbase._paginate(fetch, 0, 10, "test")) == 2
+
+
+def test_paginate_follows_full_pages():
+    fetch = pages(
+        [entry("a", 1), entry("b", 2)],
+        [entry("c", 3), entry("d", 4)],
+        [entry("e", 5)],
+    )
+    result = coinbase._paginate(fetch, 0, 2, "test")
+    assert [e["id"] for e in result] == ["a", "b", "c", "d", "e"]
+
+
+def test_paginate_advances_past_the_last_timestamp():
+    """Without the +1 the boundary entry is refetched on every page."""
+    seen_cursors = []
+
+    def fetch(cursor, limit):
+        seen_cursors.append(cursor)
+        return [entry("a", 100), entry("b", 200)] if len(seen_cursors) == 1 else []
+
+    coinbase._paginate(fetch, 0, 2, "test")
+    assert seen_cursors == [0, 201]
+
+
+def test_paginate_breaks_when_the_exchange_ignores_since():
+    """
+    An exchange that re-serves the same full page would otherwise loop
+    forever. The id guard has to catch it.
+    """
+    same = [entry("a", 1), entry("b", 2)]
+
+    def fetch(cursor, limit):
+        return list(same)
+
+    result = coinbase._paginate(fetch, 0, 2, "test")
+    assert [e["id"] for e in result] == ["a", "b"]
+
+
+def test_paginate_stops_when_a_page_has_no_timestamp():
+    fetch = pages(
+        [entry("a", 1), entry("b", None)],
+        [entry("c", 3)],
+    )
+    result = coinbase._paginate(fetch, 0, 2, "test")
+    assert [e["id"] for e in result] == ["a", "b"]
+
+
+def test_paginate_handles_entries_without_ids():
+    """
+    Treating a missing id as a duplicate would break after page one. Endpoints
+    that don't set ids must still paginate.
+    """
+    fetch = pages(
+        [{"timestamp": 1}, {"timestamp": 2}],
+        [{"timestamp": 3}],
+    )
+    assert len(coinbase._paginate(fetch, 0, 2, "test")) == 3
+
+
+def test_paginate_has_a_hard_page_cap():
+    """Backstop for a runaway walk where the id guard can't apply."""
+    counter = {"n": 0}
+
+    def fetch(cursor, limit):
+        counter["n"] += 1
+        return [{"timestamp": counter["n"]}, {"timestamp": counter["n"] + 1}]
+
+    coinbase._paginate(fetch, 0, 2, "test")
+    assert counter["n"] <= coinbase._MAX_PAGES + 1
+
+
+def test_paginate_on_empty_history():
+    assert coinbase._paginate(pages([]), 0, 10, "test") == []
+
+
+# ---------------------------------------------------------------------------
+# _resolve_since
+# ---------------------------------------------------------------------------
+
+class FakeExchange:
+    """Only the two ccxt methods _resolve_since touches."""
+
+    @staticmethod
+    def parse8601(value):
+        import datetime as dt
+        try:
+            return int(dt.datetime.fromisoformat(
+                value.replace("Z", "+00:00")).timestamp() * 1000)
+        except (ValueError, AttributeError):
+            return None
+
+
+def test_resolve_since_passes_milliseconds_through():
+    assert coinbase._resolve_since(FakeExchange(), 1_700_000_000_000) == 1_700_000_000_000
+
+
+def test_resolve_since_parses_iso8601():
+    assert coinbase._resolve_since(FakeExchange(), "2026-01-01T00:00:00Z") == \
+        coinbase._resolve_since(FakeExchange(), None)
+
+
+def test_resolve_since_defaults_to_competition_start():
+    assert coinbase._resolve_since(FakeExchange(), None) is not None
+
+
+def test_resolve_since_rejects_garbage():
+    with pytest.raises(ValueError, match="ISO8601"):
+        coinbase._resolve_since(FakeExchange(), "not a date")
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
 def test_quote_priority_entries_are_all_usd_equivalents():
     """
     Every preferred quote currency must also be treated as $1, or a coin
