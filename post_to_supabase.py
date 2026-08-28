@@ -4,26 +4,11 @@ import sys
 from supabase import create_client
 from dotenv import load_dotenv
 
-import coinbase
-import lighter
+import venues
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
-
-# Which module handles which venue.
-#
-# Every adapter exposes the same four calls - build_exchange,
-# get_account_totals_usdc, closed_orders, get_cash_flows - so the sync loop
-# below never branches on venue. Adding a third exchange means writing an
-# adapter and adding one line here.
-#
-# Keyed by the ccxt id stored in participant_api_keys.exchange, which is also
-# what gets stamped on every row the credential produces.
-VENUES = {
-    'coinbase': coinbase,
-    'lighter': lighter,
-}
 
 
 def _require_env(*names: str) -> None:
@@ -374,21 +359,19 @@ def sync_all_to_supabase() -> dict:
                                participant_id, label)
                 continue
 
-            venue = VENUES.get(exchange_id)
-            if venue is None:
+            try:
+                venue = venues.get(exchange_id)
+            except venues.UnknownVenue as e:
                 # Registered against an exchange with no adapter. Counted as a
                 # failure rather than skipped: someone signed up expecting to
                 # be scored, and silently omitting them from the leaderboard
-                # is the worst available outcome.
+                # is the worst available outcome - worse still on a
+                # cross-exchange strategy, where the remaining venue reads as
+                # a naked position rather than one leg of a hedge.
                 attempted += 1
                 failed += 1
                 task_failures += 1
-                log_fetch_error(
-                    participant_id,
-                    ValueError(f"No adapter for exchange '{exchange_id}' - "
-                               f"known venues are {sorted(VENUES)}"),
-                    label,
-                )
+                log_fetch_error(participant_id, e, label)
                 continue
 
             attempted += 1
