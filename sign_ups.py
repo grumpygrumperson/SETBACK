@@ -5,9 +5,8 @@ import pandas as pd
 from supabase import create_client
 from dotenv import load_dotenv
 
-import coinbase
-import lighter
-from coinbase import _get_fernet
+import venues
+from venue_common import get_fernet
 
 # Reads participant signups from CSV, verifies their exchange credentials,
 # and stores them encrypted across `participants` and `participant_api_keys`.
@@ -20,16 +19,6 @@ supabase = create_client(os.getenv("SUPABASE_URL"),
                          os.getenv("SUPABASE_KEY"))
 
 SIGNUPS_CSV = "participant_signups.csv"
-
-# Same registry as post_to_supabase.VENUES. Kept here too rather than imported
-# because importing that module would run its environment check (it demands
-# FERNET_KEY and SUPABASE_*) and build a second Supabase client as a side
-# effect of registering someone.
-VENUES = {
-    'coinbase': coinbase,
-    'lighter': lighter,
-}
-
 
 def _clean(value) -> str:
     """
@@ -57,12 +46,12 @@ def encrypt_value(value) -> str:
     """
     Encrypt a value for storage.
 
-    Uses the shared MultiFernet from coinbase rather than building a bare
-    Fernet here: MultiFernet always encrypts with the CURRENT key, so a
-    signup during a rotation writes new-key ciphertext instead of quietly
-    adding rows under the key being retired.
+    Uses the shared MultiFernet rather than building a bare Fernet here:
+    MultiFernet always encrypts with the CURRENT key, so a signup during a
+    rotation writes new-key ciphertext instead of quietly adding rows under
+    the key being retired.
     """
-    return _get_fernet().encrypt(str(value).encode()).decode()
+    return get_fernet().encrypt(str(value).encode()).decode()
 
 
 def register_participant(row) -> str:
@@ -82,116 +71,29 @@ def register_participant(row) -> str:
     return response.data[0]["id"]
 
 
-def _verify_lighter(row, account_type: str) -> dict:
-    """
-    Verify a Lighter credential and resolve its account index.
-
-    Lighter differs from Coinbase in three ways that all have to be caught
-    here rather than at sync time, when the participant is no longer around
-    to fix anything:
-
-      - it is PERPS ONLY, so a row registered as 'spot' is a mistake
-      - the whole credential is one value in api_key; there is no secret
-      - the account index lives inside a read-only token, so resolving it
-        costs no API call at all
-
-    The live call at the end is what proves the credential actually works.
-    """
-    if account_type != lighter.ACCOUNT_TYPE:
-        raise ValueError(
-            f"Lighter has no '{account_type}' market - register this "
-            f"credential as '{lighter.ACCOUNT_TYPE}'"
-        )
-
-    # Plaintext here; encrypted further down, once proven to work.
-    exchange = lighter.build_exchange(_clean(row["api_key"]), encrypted=False)
-
-    account_index = lighter.find_account_index(exchange)
-    if account_index is None:
-        raise ValueError(
-            "No Lighter account for this credential - the wallet may not have "
-            "deposited yet"
-        )
-
-    # Proves authentication, not just that the token parses.
-    exchange.fetch_balance()
-
-    # Standard accounts trade free; Premium accounts pay maker/taker fees that
-    # appear NOWHERE in the fill or market data. Their gross performance would
-    # be overstated against Coinbase traders, whose fees are recorded - so flag
-    # it while someone is watching.
-    try:
-        fees = lighter.get_account_fee_tier(exchange, account_index)
-        if not fees.get('fees_are_zero'):
-            logger.warning(
-                "Lighter account %s is tier '%s' (taker tick %s, maker tick "
-                "%s) - it pays fees that Lighter does not report per trade, "
-                "so this participant's costs will be missing from their "
-                "returns", account_index, fees.get('user_tier'),
-                fees.get('taker_fee_tick'), fees.get('maker_fee_tick'),
-            )
-    except Exception as e:
-        # Informational only - never block a registration over it.
-        logger.warning("Could not read Lighter fee tier for %s: %s",
-                       account_index, e)
-
-    return {
-        'account_type': lighter.ACCOUNT_TYPE,
-        # Reused as the venue's account handle, like Coinbase's portfolio
-        # UUID. The column is text; the index is an int.
-        'portfolio_uuid': str(account_index),
-        'passphrase': None,
-    }
-
-
 def verify_and_describe(row) -> dict:
     """
-    Check the credentials actually work before storing them, and resolve the
+    Check a credential actually works before storing it, and resolve the
     venue's account handle while we have a live connection.
 
-    Doing this at signup means a participant with bad keys finds out while
-    they can still fix it, rather than silently missing from the leaderboard.
-    Raises if the credentials don't authenticate.
+    Pure dispatch: every adapter implements verify_credential(), so the
+    venue-specific checks live with the venue rather than as branches here.
+    Coinbase resolves an INTX portfolio UUID; Lighter refuses a 'spot'
+    registration and reads its account index out of the token.
+
+    Doing this at signup means a participant with bad credentials finds out
+    while they can still fix it, rather than silently missing from the
+    leaderboard.
     """
-    account_type = (_clean(row.get("account_type")) or "spot").lower()
-    passphrase = _clean(row.get("api_passphrase"))
-    exchange_id = _clean(row.get("exchange")) or "coinbase"
+    venue = venues.get(_clean(row.get("exchange")) or "coinbase")
 
-    if exchange_id not in VENUES:
-        raise ValueError(
-            f"No adapter for exchange '{exchange_id}' - known venues are "
-            f"{sorted(VENUES)}"
-        )
-
-    if exchange_id == 'lighter':
-        return _verify_lighter(row, account_type)
-
-    # Plaintext at this point - they're encrypted further down, after they've
-    # been proven to work.
-    exchange = coinbase.build_exchange(
-        _clean(row["api_key"]),
-        _clean(row.get("api_secret")),
-        exchange_id,
-        encrypted=False,
-        passphrase=passphrase,
-    )
-
-    portfolio_uuid = None
-    if account_type == "perp":
-        # Costs one API call, run once here rather than on every sync.
-        portfolio_uuid = coinbase.find_perp_portfolio_uuid(exchange)
-        if not portfolio_uuid:
-            raise ValueError(
-                "No perp portfolio visible to these credentials - the key may "
-                "be scoped to the spot portfolio instead"
-            )
-    else:
-        # Cheap auth check. Kept venue-agnostic - no exchange-specific params -
-        # since participants may register on exchanges other than Coinbase.
-        exchange.fetch_balance()
-
-    return {"account_type": account_type, "portfolio_uuid": portfolio_uuid,
-            "passphrase": passphrase}
+    return venue.verify_credential({
+        "api_key": _clean(row.get("api_key")),
+        "api_secret": _clean(row.get("api_secret")),
+        "api_passphrase": _clean(row.get("api_passphrase")),
+        "account_type": _clean(row.get("account_type")),
+        "exchange": _clean(row.get("exchange")) or "coinbase",
+    })
 
 
 def register_credential(participant_id, row, details: dict) -> None:
