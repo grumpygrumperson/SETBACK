@@ -50,14 +50,19 @@ Four differences shape this whole module:
    symbol and paginates properly, so closed_orders() here is built by
    aggregating fills into orders. See its docstring.
 
-UNVERIFIED
-----------
-None of this has run against a live Lighter account - there are no Lighter
-credentials in this project yet. The API shapes come from ccxt's source and
-its documented response samples. The figures most worth checking first are
-called out at their call sites: total_asset_value in
-get_account_totals_usdc, and the transfer amount/currency fields in
-get_cash_flows.
+VERIFIED AGAINST A LIVE ACCOUNT
+-------------------------------
+Read-only token auth, balance, fills, order aggregation, cash flows and the
+fee tier have all run against a funded Lighter account holding an open
+position. The equity figure was confirmed there: with a position open,
+total_asset_value (14.991) = collateral (15.000) + unrealized_pnl (-0.009),
+so it is net liquidation value and collateral alone would have understated
+the loss.
+
+Still unconfirmed: fee_cost. Lighter's trade payload carries no fee field,
+and this account is Standard tier, which pays nothing. A Premium account
+pays fees that appear in neither the fill nor the market data - see
+get_account_fee_tier().
 """
 
 import logging
@@ -66,7 +71,8 @@ import time
 import ccxt
 from cryptography.fernet import InvalidToken
 from dotenv import load_dotenv
-from coinbase import USD_EQUIVALENTS, _amount, _get_fernet, _resolve_since
+from venue_common import (USD_EQUIVALENTS, get_fernet, money_amount,
+                          resolve_since)
 
 load_dotenv()
 
@@ -170,7 +176,7 @@ def build_exchange_from_token(token: str, encrypted: bool = True,
 
     if encrypted:
         try:
-            token = _get_fernet().decrypt(token.encode()).decode()
+            token = get_fernet().decrypt(token.encode()).decode()
         except InvalidToken as e:
             raise ValueError(
                 "Could not decrypt the Lighter token - wrong FERNET_KEY, or "
@@ -253,7 +259,7 @@ def build_exchange(private_key: str, encrypted: bool = True,
 
     if encrypted:
         try:
-            probe = _get_fernet().decrypt(private_key.encode()).decode()
+            probe = get_fernet().decrypt(private_key.encode()).decode()
         except InvalidToken:
             probe = ''
         if probe.strip().startswith(_TOKEN_PREFIX):
@@ -263,7 +269,7 @@ def build_exchange(private_key: str, encrypted: bool = True,
 
     if encrypted:
         try:
-            private_key = _get_fernet().decrypt(private_key.encode()).decode()
+            private_key = get_fernet().decrypt(private_key.encode()).decode()
         except InvalidToken as e:
             raise ValueError(
                 "Could not decrypt the Lighter private key - wrong FERNET_KEY, "
@@ -311,6 +317,74 @@ def build_exchange(private_key: str, encrypted: bool = True,
         exchange.options['apiKeyIndex'] = api_key_index
 
     return exchange
+
+
+def verify_credential(row: dict) -> dict:
+    """
+    Prove a Lighter credential works, at signup, and resolve its account
+    handle. Part of the venue contract - see venues.REQUIRED_FUNCTIONS.
+
+    `row` is a signup record with at least api_key and account_type; returns
+    {'account_type', 'portfolio_uuid', 'passphrase'} for storage.
+
+    Three Lighter-specific checks live here rather than in the importer,
+    because they are facts about this venue and nothing else:
+
+      - PERPS ONLY, so a row registered as 'spot' is a mistake worth catching
+        while the participant can still fix it
+      - the whole credential is one value in api_key; there is no secret
+      - the account index is inside the read-only token, so resolving it
+        costs no API call
+
+    The live fetch_balance() is what separates "the token parses" from "the
+    token authenticates".
+    """
+    account_type = (str(row.get('account_type') or ACCOUNT_TYPE)).strip().lower()
+
+    if account_type != ACCOUNT_TYPE:
+        raise ValueError(
+            f"Lighter has no '{account_type}' market - register this "
+            f"credential as '{ACCOUNT_TYPE}'"
+        )
+
+    # Plaintext here; encrypted by the caller once proven to work.
+    exchange = build_exchange(str(row['api_key']).strip(), encrypted=False)
+
+    account_index = find_account_index(exchange)
+    if account_index is None:
+        raise ValueError(
+            "No Lighter account for this credential - the wallet may not have "
+            "deposited yet"
+        )
+
+    exchange.fetch_balance()
+
+    # Standard accounts trade free; Premium accounts pay maker/taker fees that
+    # appear NOWHERE in the fill or the market data. Their gross performance
+    # would be overstated against Coinbase traders, whose fees ARE recorded -
+    # so flag it while someone is watching.
+    try:
+        fees = get_account_fee_tier(exchange, account_index)
+        if not fees.get('fees_are_zero'):
+            logger.warning(
+                "Lighter account %s is tier '%s' (taker tick %s, maker tick "
+                "%s) - it pays fees Lighter does not report per trade, so this "
+                "participant's costs will be missing from their returns",
+                account_index, fees.get('user_tier'),
+                fees.get('taker_fee_tick'), fees.get('maker_fee_tick'),
+            )
+    except Exception as e:
+        # Informational only - never block a registration over it.
+        logger.warning("Could not read Lighter fee tier for %s: %s",
+                       account_index, e)
+
+    return {
+        'account_type': ACCOUNT_TYPE,
+        # The venue's account handle, same column as Coinbase's portfolio
+        # UUID. The column is text; the index is an int.
+        'portfolio_uuid': str(account_index),
+        'passphrase': None,
+    }
 
 
 def build_from_credential(credential: dict) -> ccxt.Exchange:
@@ -470,8 +544,8 @@ def get_account_totals_usdc(exchange: ccxt.Exchange, account_type: str = ACCOUNT
 
     account = accounts[0]
 
-    collateral = _amount(account.get('collateral'))
-    total = _amount(account.get('total_asset_value'), default=collateral)
+    collateral = money_amount(account.get('collateral'))
+    total = money_amount(account.get('total_asset_value'), default=collateral)
 
     if not total and collateral:
         # Never let a missing field zero out a real balance: a snapshot of 0
@@ -489,8 +563,8 @@ def get_account_totals_usdc(exchange: ccxt.Exchange, account_type: str = ACCOUNT
         'account_type': ACCOUNT_TYPE,
         'total_usdc': total,
         'collateral_usdc': collateral,
-        'available_usdc': _amount(account.get('available_balance')),
-        'cross_asset_usdc': _amount(account.get('cross_asset_value')),
+        'available_usdc': money_amount(account.get('available_balance')),
+        'cross_asset_usdc': money_amount(account.get('cross_asset_value')),
     }
 
 
@@ -597,7 +671,7 @@ def closed_trades(exchange: ccxt.Exchange, symbol: str = None, since=None,
     fetch_closed_orders requires a symbol and returns only the most recent
     100 per market.
     """
-    since = _resolve_since(exchange, since)
+    since = resolve_since(exchange, since)
 
     params = {}
     if portfolio_uuid:
@@ -739,7 +813,7 @@ def get_cash_flows(exchange: ccxt.Exchange, since=None, limit: int = 100,
     fetch_deposits additionally requires the L1 address, which is derived
     from the private key.
     """
-    since = _resolve_since(exchange, since)
+    since = resolve_since(exchange, since)
 
     params = {}
     if portfolio_uuid:
