@@ -1,13 +1,22 @@
 import ccxt
 import logging
 import os
-from cryptography.fernet import Fernet, InvalidToken, MultiFernet
+from cryptography.fernet import InvalidToken
 from dotenv import load_dotenv
 
+# Competition-wide, not Coinbase's. See venue_common for why these don't live
+# here any more: lighter.py used to import them from this module, which made
+# Coinbase a dependency of a Lighter-only sync.
+from venue_common import (COMPETITION_START, QUOTE_PRIORITY, USD_EQUIVALENTS,
+                          get_fernet, money_amount, resolve_since)
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+# ccxt's id for this venue, matching the key in venues.VENUES and the value
+# stored in participant_api_keys.exchange.
+EXCHANGE_ID = 'coinbase'
 
 # Your own keys, by venue. Coinbase issues separate credentials for spot and
 # perps, so each venue reads its own pair. Participants' keys never come from
@@ -21,36 +30,6 @@ ENV_CREDENTIALS = {
 # live credentials in plaintext on disk, outside the encryption everything
 # else depends on. To test another participant's keys ad hoc, pass them
 # straight to build_exchange(key, secret, encrypted=False).
-
-# Stablecoins and fiat-pegged currencies treated as 1:1 with USD.
-#
-# Defined ONCE, for the same reason as COMPETITION_START below. These used to
-# be re-declared inside price_balances_in_usdc and get_account_totals_usdc,
-# which shadowed this set: adding a stablecoin here changed how a historical
-# transfer was valued (_price_at_usdc reads this one) but not how a live
-# balance was, so the same coin could be worth $1 in one calculation and a
-# ticker lookup in another.
-USD_EQUIVALENTS = {
-    'USDC', 'USDT', 'USD', 'BUSD', 'DAI', 'TUSD', 'USDP', 'GUSD',
-    'FDUSD', 'USDD', 'FRAX', 'LUSD', 'SUSD', 'USDN', 'USDJ', 'MAMUSD',
-}
-# Preferred quote currencies to try, in order
-QUOTE_PRIORITY = ['USDC', 'USDT', 'USD', 'BUSD', 'FDUSD']
-
-# When the competition starts. Everything that reads history - orders, trades,
-# cash flows - falls back to this when no `since` is given, so it decides what
-# counts as in-competition activity.
-#
-# One place, not three: with the date inlined per function, moving the start
-# and missing one would give you flows from a different window than orders,
-# and the returns computed from them would be quietly wrong.
-#
-# Override with COMPETITION_START in the environment to change it without a
-# redeploy - e.g. COMPETITION_START=2020-01-01T00:00:00Z to pull full history.
-COMPETITION_START = os.getenv("COMPETITION_START", "2026-01-01T00:00:00Z")
-
-_fernet: MultiFernet | None = None
-
 
 def exchange_from_env(account_type: str = 'spot') -> ccxt.Exchange:
     """
@@ -85,43 +64,6 @@ def exchange_from_env(account_type: str = 'spot') -> ccxt.Exchange:
                         if account_type == 'perp' else None),
     )
 
-def _get_fernet() -> MultiFernet:
-    """
-    Lazily build the cipher so importing this module doesn't require
-    FERNET_KEY to be set (only the credential-decrypting paths need it).
-
-    Returns a MultiFernet, not a plain Fernet, so keys can be ROTATED:
-
-      FERNET_KEY           the current key. Everything is encrypted with this.
-      FERNET_KEYS_RETIRED  comma-separated older keys, decrypt-only.
-
-    MultiFernet encrypts with the first key and decrypts with any of them, so
-    a rotation doesn't strand existing rows. Without this, changing
-    FERNET_KEY orphans every stored credential at once and all 100
-    participants have to issue new exchange keys - which is why a leaked key
-    would otherwise be unrecoverable rather than merely urgent.
-
-    Rotation: put the new key in FERNET_KEY, move the old one to
-    FERNET_KEYS_RETIRED, run rotate_credentials.py, then drop the retired
-    entry once it reports everything re-encrypted.
-    """
-    global _fernet # sets _fernet as a global variable
-    if _fernet is None:
-        key = os.getenv("FERNET_KEY")
-        if not key:
-            raise RuntimeError(
-                "FERNET_KEY is not set - cannot decrypt participant credentials"
-            )
-
-        keys = [Fernet(key.strip().encode())]
-        retired = os.getenv("FERNET_KEYS_RETIRED", "")
-        keys.extend(
-            Fernet(k.strip().encode()) for k in retired.split(",") if k.strip()
-        )
-
-        _fernet = MultiFernet(keys)
-    return _fernet
-
 
 def build_exchange(api_key: str, api_secret: str, exchange_id: str = 'coinbase',
                    encrypted: bool = True, passphrase: str = None,
@@ -152,7 +94,7 @@ def build_exchange(api_key: str, api_secret: str, exchange_id: str = 'coinbase',
         raise ValueError("Both api_key and api_secret are required")
 
     if encrypted:
-        fernet = _get_fernet()
+        fernet = get_fernet()
         try:
             api_key = fernet.decrypt(api_key.encode()).decode()
             api_secret = fernet.decrypt(api_secret.encode()).decode()
@@ -185,6 +127,49 @@ def build_exchange(api_key: str, api_secret: str, exchange_id: str = 'coinbase',
         exchange.options['portfolio'] = portfolio_uuid
 
     return exchange
+
+
+def verify_credential(row: dict) -> dict:
+    """
+    Prove a Coinbase credential works, at signup, and resolve its account
+    handle. Part of the venue contract - see venues.REQUIRED_FUNCTIONS.
+
+    `row` is a signup record with api_key, api_secret, account_type and an
+    optional api_passphrase; returns {'account_type', 'portfolio_uuid',
+    'passphrase'} for storage.
+
+    A perp credential additionally resolves its INTX portfolio UUID. That
+    costs one API call, paid once here rather than on every sync - and it
+    doubles as the auth check, since an unauthorised key can't list
+    portfolios.
+    """
+    account_type = (str(row.get('account_type') or 'spot')).strip().lower()
+    passphrase = row.get('api_passphrase') or None
+    exchange_id = row.get('exchange') or 'coinbase'
+
+    # Plaintext here; encrypted by the caller once proven to work.
+    exchange = build_exchange(
+        row['api_key'],
+        row.get('api_secret'),
+        exchange_id,
+        encrypted=False,
+        passphrase=passphrase,
+    )
+
+    portfolio_uuid = None
+    if account_type == 'perp':
+        portfolio_uuid = find_perp_portfolio_uuid(exchange)
+        if not portfolio_uuid:
+            raise ValueError(
+                "No perp portfolio visible to these credentials - the key may "
+                "be scoped to the spot portfolio instead"
+            )
+    else:
+        # Cheap auth check, no exchange-specific params.
+        exchange.fetch_balance()
+
+    return {'account_type': account_type, 'portfolio_uuid': portfolio_uuid,
+            'passphrase': passphrase}
 
 
 def build_from_credential(credential: dict) -> ccxt.Exchange:
@@ -259,21 +244,6 @@ def price_balances_in_usdc(exchange: ccxt.Exchange, balances: dict = None, price
 
     return total_usdc_value
 
-
-def _amount(field, default: float = 0.0) -> float:
-    """
-    Unwrap a Coinbase money field. INTX returns amounts either bare
-    ("collateral": "12.0897") or wrapped ({"value": "12.0897",
-    "currency": "USDC"}), so both shapes are handled here.
-    """
-    if field is None:
-        return default
-    if isinstance(field, dict):
-        field = field.get('value')
-    try:
-        return float(field)
-    except (TypeError, ValueError):
-        return default
 
 
 def find_perp_portfolio_uuid(exchange: ccxt.Exchange) -> str:
@@ -371,11 +341,11 @@ def get_perp_account_value(exchange: ccxt.Exchange, portfolio_uuid: str = None) 
         'datetime': exchange.iso8601(timestamp),
         'account_type': 'perp',
         # Net liquidation value - the figure to rank participants on
-        'total_usdc': _amount(summary.get('total_balance') or portfolio.get('total_balance')),
-        'collateral_usdc': _amount(portfolio.get('collateral')),
-        'unrealized_pnl_usdc': _amount(summary.get('unrealized_pnl') or portfolio.get('unrealized_pnl')),
-        'notional_usdc': _amount(portfolio.get('position_notional')),
-        'buying_power_usdc': _amount(summary.get('buying_power')),
+        'total_usdc': money_amount(summary.get('total_balance') or portfolio.get('total_balance')),
+        'collateral_usdc': money_amount(portfolio.get('collateral')),
+        'unrealized_pnl_usdc': money_amount(summary.get('unrealized_pnl') or portfolio.get('unrealized_pnl')),
+        'notional_usdc': money_amount(portfolio.get('position_notional')),
+        'buying_power_usdc': money_amount(summary.get('buying_power')),
     }
 
 # print(get_perp_account_value(exchange))
@@ -497,32 +467,11 @@ def account_type_from_order(order: dict) -> str:
     return product_type.lower() or None
 
 
-
-def _resolve_since(exchange: ccxt.Exchange, since) -> int:
-    """
-    Normalise `since` to milliseconds.
-
-    Accepts a millisecond int (ccxt's convention, what the sync passes), an
-    ISO8601 string (convenient by hand), or None for COMPETITION_START.
-    """
-    if since is None:
-        since = exchange.parse8601(COMPETITION_START)
-    elif isinstance(since, str):
-        since = exchange.parse8601(since)
-
-    if since is None:
-        raise ValueError(
-            "since could not be resolved to a valid timestamp - pass "
-            "milliseconds (int) or a parseable ISO8601 string like "
-            "'2026-05-01T00:00:00Z'"
-        )
-    return since
-
-
 # A page walk can't safely be open-ended. If an exchange ignores `since` and
-# re-serves the same full page, the id guard below catches it - but only for
-# entries that HAVE ids. This is the backstop for the case where they don't.
-# At limit=200 this allows 200,000 records, far past any real participant.
+# re-serves the same full page, the id guard in _paginate catches it - but
+# only for entries that HAVE ids. This is the backstop for the case where they
+# don't. At limit=200 this allows 200,000 records, far past any real
+# participant.
 _MAX_PAGES = 1000
 
 
@@ -604,7 +553,7 @@ def closed_orders(exchange: ccxt.Exchange, symbol: str = None, since=None, limit
     if portfolio_uuid:
         request_params['retail_portfolio_id'] = portfolio_uuid
 
-    since = _resolve_since(exchange, since)
+    since = resolve_since(exchange, since)
 
     # symbol=None returns all symbols in one call on Coinbase
     raw_orders = _paginate(
@@ -687,7 +636,7 @@ def closed_trades(exchange: ccxt.Exchange, symbol: str = None, since=None,
     if portfolio_uuid:
         request_params['retail_portfolio_id'] = portfolio_uuid
 
-    since = _resolve_since(exchange, since)
+    since = resolve_since(exchange, since)
 
     raw_trades = _paginate(
         lambda cursor, page_size: exchange.fetch_my_trades(
@@ -877,7 +826,7 @@ def get_cash_flows(exchange: ccxt.Exchange, since=None, limit: int = 100,
 
     `since` accepts milliseconds or an ISO8601 string, matching closed_orders.
     """
-    since = _resolve_since(exchange, since)
+    since = resolve_since(exchange, since)
 
     try:
         raw = _paginate_transfers(exchange, None, since, limit)
