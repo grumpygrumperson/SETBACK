@@ -22,7 +22,7 @@ import os
 from dotenv import load_dotenv
 from supabase import create_client
 
-from coinbase import _get_fernet
+from venue_common import get_fernet
 from cryptography.fernet import Fernet, InvalidToken
 
 load_dotenv()
@@ -44,7 +44,7 @@ def rotate_all() -> None:
     with the first - so this needs no record of which key a row was written
     under, and no key_version column to drift out of sync with reality.
     """
-    fernet = _get_fernet()
+    fernet = get_fernet()
 
     rows = supabase.table("participant_api_keys").select(
         "id,participant_id,api_key,api_secret,api_passphrase"
