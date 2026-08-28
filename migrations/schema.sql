@@ -51,9 +51,11 @@ create table if not exists public.participant_api_keys (
   exchange       text not null,               -- ccxt id, e.g. 'coinbase'
   account_type   text not null,               -- 'spot' | 'perp'
   api_key        text not null,               -- Fernet encrypted
-  api_secret     text not null,               -- Fernet encrypted
+  api_secret     text,                        -- Fernet encrypted; null on
+                                              -- single-credential venues
   api_passphrase text,                        -- Fernet encrypted; some venues only
-  portfolio_uuid text,                        -- Coinbase perps (INTX)
+  portfolio_uuid text,                        -- Coinbase: INTX portfolio UUID
+                                              -- Lighter:  account index
   is_active      boolean not null default true,
   created_at     timestamptz not null default now(),
 
@@ -87,19 +89,36 @@ alter table public.participant_api_keys
   add constraint participant_api_keys_account_type_check
   check (account_type in ('spot', 'perp'));
 
+-- Not every venue issues a key/secret PAIR. Coinbase does; Lighter
+-- authenticates with a single value - a read-only token, or an L1 private
+-- key - which is stored in api_key with nothing to put here. Forcing a
+-- placeholder into a NOT NULL column would make the table lie about what it
+-- holds, and the placeholder would eventually be handed to an exchange.
+alter table public.participant_api_keys
+  alter column api_secret drop not null;
+
 
 -- ---------------------------------------------------------------------------
 -- 3. Trade metrics — closed orders
 --
--- Order IDs are only unique PER VENUE, so the key includes account_type. With
--- order_id alone, a spot and a perp order sharing an ID would overwrite each
--- other; Postgres also treats NULLs as distinct, so account_type must be NOT
--- NULL or duplicates re-insert on every run.
+-- Order IDs are only unique PER VENUE, so the key is
+-- (participant_id, exchange, account_type, order_id). Postgres also treats
+-- NULLs as distinct, so both venue columns must be NOT NULL or duplicates
+-- re-insert on every run.
+--
+-- `exchange` is not decoration. Coinbase INTX and Lighter are both 'perp',
+-- so without it one participant's two venues are the same row to this table -
+-- and get_last_synced_timestamp(pid, 'perp') would return the newest
+-- timestamp across BOTH. Syncing Coinbase after Lighter had traded more
+-- recently would resume from Lighter's last trade and skip every Coinbase
+-- order in between. Resume points only move forward, so those orders would
+-- never be fetched again.
 -- ---------------------------------------------------------------------------
 
 create table if not exists public.trade_metrics (
   id             bigint generated always as identity primary key,
   participant_id uuid not null references public.participants(id) on delete cascade,
+  exchange       text not null,               -- ccxt id: 'coinbase' | 'lighter'
   account_type   text not null,
   order_id       text not null,
   timestamp      bigint,                      -- exchange ms, ccxt convention
@@ -127,15 +146,27 @@ alter table public.trade_metrics add column if not exists account_type text;
 update public.trade_metrics set account_type = 'spot' where account_type is null;
 alter table public.trade_metrics alter column account_type set not null;
 
+-- Every row that predates multi-venue support is Coinbase - it was the only
+-- venue that existed. Backfilled before the NOT NULL so the alter succeeds.
+alter table public.trade_metrics add column if not exists exchange text;
+update public.trade_metrics set exchange = 'coinbase' where exchange is null;
+alter table public.trade_metrics alter column exchange set not null;
+
+-- The pre-venue key. Dropped so the wider one can replace it; leaving both
+-- would reject a Lighter order that legitimately shares an order_id with a
+-- Coinbase one.
+alter table public.trade_metrics
+  drop constraint if exists trade_metrics_participant_account_order_key;
+
 do $$
 begin
   if not exists (
     select 1 from pg_constraint
-     where conname = 'trade_metrics_participant_account_order_key'
+     where conname = 'trade_metrics_participant_venue_order_key'
   ) then
     alter table public.trade_metrics
-      add constraint trade_metrics_participant_account_order_key
-      unique (participant_id, account_type, order_id);
+      add constraint trade_metrics_participant_venue_order_key
+      unique (participant_id, exchange, account_type, order_id);
   end if;
 end $$;
 
@@ -163,14 +194,15 @@ alter table public.trade_metrics
 create table if not exists public.balance_snapshots (
   id             bigint generated always as identity primary key,
   participant_id uuid not null references public.participants(id) on delete cascade,
+  exchange       text not null,               -- ccxt id: 'coinbase' | 'lighter'
   account_type   text not null,
   timestamp      bigint not null,             -- exchange ms
   total_usdc     numeric,
   detail         jsonb,
   created_at     timestamptz not null default now(),
 
-  constraint balance_snapshots_participant_account_ts_key
-    unique (participant_id, account_type, timestamp)
+  constraint balance_snapshots_participant_venue_ts_key
+    unique (participant_id, exchange, account_type, timestamp)
 );
 
 -- The constraint above is declared inline, which is a NO-OP on a table that
@@ -179,23 +211,32 @@ create table if not exists public.balance_snapshots (
 -- "42P10: no unique or exclusion constraint matching the ON CONFLICT
 -- specification". Added explicitly here so re-running this file repairs it.
 --
+-- Backfill before the NOT NULL, as with trade_metrics.
+alter table public.balance_snapshots add column if not exists exchange text;
+update public.balance_snapshots set exchange = 'coinbase' where exchange is null;
+alter table public.balance_snapshots alter column exchange set not null;
+
 -- Duplicates must go first, or the constraint refuses to build.
 delete from public.balance_snapshots a
  using public.balance_snapshots b
  where a.id > b.id
    and a.participant_id = b.participant_id
+   and a.exchange       = b.exchange
    and a.account_type   = b.account_type
    and a.timestamp      = b.timestamp;
+
+alter table public.balance_snapshots
+  drop constraint if exists balance_snapshots_participant_account_ts_key;
 
 do $$
 begin
   if not exists (
     select 1 from pg_constraint
-     where conname = 'balance_snapshots_participant_account_ts_key'
+     where conname = 'balance_snapshots_participant_venue_ts_key'
   ) then
     alter table public.balance_snapshots
-      add constraint balance_snapshots_participant_account_ts_key
-      unique (participant_id, account_type, timestamp);
+      add constraint balance_snapshots_participant_venue_ts_key
+      unique (participant_id, exchange, account_type, timestamp);
   end if;
 end $$;
 
@@ -250,6 +291,7 @@ create table if not exists public.fetch_errors (
 create table if not exists public.cash_flows (
   id             bigint generated always as identity primary key,
   participant_id uuid not null references public.participants(id) on delete cascade,
+  exchange       text not null,               -- ccxt id: 'coinbase' | 'lighter'
   account_type   text not null,
   transfer_id    text not null,
   timestamp      bigint not null,             -- exchange ms
@@ -261,8 +303,8 @@ create table if not exists public.cash_flows (
   raw_type       text,                        -- exchange's own label, for auditing
   created_at     timestamptz not null default now(),
 
-  constraint cash_flows_participant_account_transfer_key
-    unique (participant_id, account_type, transfer_id),
+  constraint cash_flows_participant_venue_transfer_key
+    unique (participant_id, exchange, account_type, transfer_id),
 
   constraint cash_flows_direction_check
     check (direction in ('in', 'out'))
@@ -272,6 +314,26 @@ create table if not exists public.cash_flows (
 -- ever wrote. Dropped here so a database created from that version converges
 -- on the same schema; no-op on a fresh one.
 alter table public.cash_flows drop column if exists is_internal;
+
+-- Backfill and re-key for multi-venue, as with the other two tables.
+alter table public.cash_flows add column if not exists exchange text;
+update public.cash_flows set exchange = 'coinbase' where exchange is null;
+alter table public.cash_flows alter column exchange set not null;
+
+alter table public.cash_flows
+  drop constraint if exists cash_flows_participant_account_transfer_key;
+
+do $$
+begin
+  if not exists (
+    select 1 from pg_constraint
+     where conname = 'cash_flows_participant_venue_transfer_key'
+  ) then
+    alter table public.cash_flows
+      add constraint cash_flows_participant_venue_transfer_key
+      unique (participant_id, exchange, account_type, transfer_id);
+  end if;
+end $$;
 
 -- Same vocabulary again. metrics.mark_internal_transfers() pairs a
 -- participant's flows across their venues; a third venue label it doesn't
@@ -291,11 +353,15 @@ alter table public.cash_flows
 -- run — 200 lookups every 15 minutes at 100 participants.
 -- ---------------------------------------------------------------------------
 
-create index if not exists trade_metrics_participant_time_idx
-  on public.trade_metrics (participant_id, account_type, timestamp desc);
+-- Column order matches the resume-point lookups exactly: they filter on
+-- participant + exchange + account_type and take the newest timestamp.
+drop index if exists trade_metrics_participant_time_idx;
+create index if not exists trade_metrics_participant_venue_time_idx
+  on public.trade_metrics (participant_id, exchange, account_type, timestamp desc);
 
-create index if not exists balance_snapshots_participant_time_idx
-  on public.balance_snapshots (participant_id, account_type, timestamp desc);
+drop index if exists balance_snapshots_participant_time_idx;
+create index if not exists balance_snapshots_participant_venue_time_idx
+  on public.balance_snapshots (participant_id, exchange, account_type, timestamp desc);
 
 create index if not exists participant_api_keys_participant_idx
   on public.participant_api_keys (participant_id) where is_active;
@@ -310,9 +376,16 @@ create index if not exists cash_flows_participant_time_idx
 -- Spot and perps are ONE competition, so total_usdc sums both venues while
 -- keeping each visible separately.
 --
--- The inner `distinct on` takes the latest snapshot PER VENUE: spot and perp
--- are written seconds apart, so grouping by participant alone and taking
--- max(timestamp) would silently drop one of them.
+-- The inner `distinct on` takes the latest snapshot PER (exchange,
+-- account_type): a participant's venues are written seconds apart, so
+-- grouping by participant alone and taking max(timestamp) would silently drop
+-- all but one.
+--
+-- exchange belongs in that key as much as account_type does. Coinbase INTX
+-- and Lighter are both 'perp', so keying on account_type alone would pick one
+-- of them and discard the other - showing a fraction of the participant's
+-- money on the leaderboard, with nothing to indicate anything was missing.
+-- spot_usdc and perp_usdc therefore sum ACROSS venues.
 --
 -- left join keeps participants with no snapshots yet on the board at 0
 -- rather than vanishing.
@@ -328,10 +401,10 @@ select
   max(b.timestamp)                                                     as as_of
 from public.participants p
 left join (
-  select distinct on (participant_id, account_type)
-         participant_id, account_type, total_usdc, timestamp
+  select distinct on (participant_id, exchange, account_type)
+         participant_id, exchange, account_type, total_usdc, timestamp
     from public.balance_snapshots
-   order by participant_id, account_type, timestamp desc
+   order by participant_id, exchange, account_type, timestamp desc
 ) b on b.participant_id = p.id
 group by p.id, p.display_name;
 

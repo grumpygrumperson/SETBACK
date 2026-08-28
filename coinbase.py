@@ -187,6 +187,25 @@ def build_exchange(api_key: str, api_secret: str, exchange_id: str = 'coinbase',
     return exchange
 
 
+def build_from_credential(credential: dict) -> ccxt.Exchange:
+    """
+    Build an exchange from one participant_api_keys row.
+
+    The uniform entry point every venue adapter provides, so the sync can
+    construct any participant's client without knowing which exchange it is.
+    Credential SHAPES differ - Coinbase needs a key/secret pair and an
+    optional passphrase, Lighter needs a single token - and this is the one
+    place per venue where that difference lives.
+    """
+    return build_exchange(
+        credential["api_key"],
+        credential.get("api_secret"),
+        credential.get("exchange") or "coinbase",
+        passphrase=credential.get("api_passphrase"),
+        portfolio_uuid=credential.get("portfolio_uuid"),
+    )
+
+
 def price_balances_in_usdc(exchange: ccxt.Exchange, balances: dict = None, price_cache: dict = None) -> float:
     """
     Convert a {coin: amount} balance dict into a total USDC value.
@@ -839,9 +858,15 @@ def _paginate_transfers(exchange: ccxt.Exchange, code: str, since: int,
     )
 
 
-def get_cash_flows(exchange: ccxt.Exchange, since=None, limit: int = 100) -> list[dict]:
+def get_cash_flows(exchange: ccxt.Exchange, since=None, limit: int = 100,
+                   portfolio_uuid=None) -> list[dict]:
     """
     External deposits and withdrawals, valued in USDC at the time they moved.
+
+    `portfolio_uuid` is accepted for interface parity with the other venue
+    adapters and deliberately unused: Coinbase's v2 transactions endpoint
+    reports for the whole ACCOUNT, not per portfolio, so scoping it would
+    silently drop transfers rather than narrow them.
 
     This is what makes returns mean anything. Without it a participant who
     deposits $1,000 mid-competition shows the transfer as profit, and every

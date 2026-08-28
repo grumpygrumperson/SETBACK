@@ -3,12 +3,27 @@ import os
 import sys
 from supabase import create_client
 from dotenv import load_dotenv
-from coinbase import (build_exchange, closed_orders, get_account_totals_usdc,
-                      get_cash_flows)
+
+import coinbase
+import lighter
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+# Which module handles which venue.
+#
+# Every adapter exposes the same four calls - build_exchange,
+# get_account_totals_usdc, closed_orders, get_cash_flows - so the sync loop
+# below never branches on venue. Adding a third exchange means writing an
+# adapter and adding one line here.
+#
+# Keyed by the ccxt id stored in participant_api_keys.exchange, which is also
+# what gets stamped on every row the credential produces.
+VENUES = {
+    'coinbase': coinbase,
+    'lighter': lighter,
+}
 
 
 def _require_env(*names: str) -> None:
@@ -60,13 +75,21 @@ def get_api_keys(participant_id) -> list[dict]:
     return response.data or []
 
 
-def get_last_synced_timestamp(participant_id, account_type: str) -> int:
+def get_last_synced_timestamp(participant_id, exchange: str, account_type: str) -> int:
     """
     Return the millisecond timestamp to resume this participant's sync from,
     i.e. one past their most recently stored order for this venue.
 
-    `account_type` is not optional: without it a participant's perp sync would
-    resume from their last spot trade and silently skip everything between.
+    Neither `exchange` nor `account_type` is optional, and leaving either out
+    causes the same silent data loss in a different direction:
+
+      no account_type   a perp sync resumes from the last SPOT trade
+      no exchange       a Coinbase perp sync resumes from the last LIGHTER
+                        trade, because both venues store account_type='perp'
+
+    Either way the resume point lands ahead of orders that were never
+    fetched, and resume points only move forward - so those orders are lost
+    for good rather than picked up on the next run.
 
     Returns None when there's nothing stored yet, which lets closed_orders()
     fall back to its own start-of-competition default.
@@ -75,6 +98,7 @@ def get_last_synced_timestamp(participant_id, account_type: str) -> int:
         supabase.table("trade_metrics")
         .select("timestamp")
         .eq("participant_id", participant_id)
+        .eq("exchange", exchange)
         .eq("account_type", account_type)
         .order("timestamp", desc=True)
         .limit(1)
@@ -88,52 +112,62 @@ def get_last_synced_timestamp(participant_id, account_type: str) -> int:
     return None
 
 
-def log_fetch_error(participant_id, error: Exception, account_type: str = None) -> None:
+def log_fetch_error(participant_id, error: Exception, venue: str = None) -> None:
     """
     Record a per-credential failure so it's visible after an unattended run -
     a participant whose keys expire mid-competition would otherwise just stop
     appearing with nothing but stdout to say why.
+
+    `venue` is a human label like 'coinbase/perp'. With two exchanges now
+    reporting account_type='perp', an error tagged only 'perp' wouldn't say
+    which one broke.
     """
-    label = f"{participant_id} ({account_type})" if account_type else str(participant_id)
+    label = f"{participant_id} ({venue})" if venue else str(participant_id)
     logger.error("Failed to sync %s: %s", label, error)
     try:
         supabase.table("fetch_errors").insert({
             "participant_id": participant_id,
-            "error_message": f"[{account_type or 'unknown'}] {error}"[:500],
+            "error_message": f"[{venue or 'unknown'}] {error}"[:500],
         }).execute()
     except Exception as e:
         # Never let error logging take down the run for everyone else
         logger.error("Could not record fetch error for %s: %s", label, e)
 
 
-def sync_orders(participant_id, credential: dict, exchange) -> int:
+def sync_orders(participant_id, credential: dict, exchange, venue) -> int:
     """
     Upsert one credential's closed orders into trade_metrics. Returns the
     number of rows Supabase accepted.
+
+    `venue` is the adapter module for this credential's exchange - coinbase
+    or lighter. Both expose closed_orders() with the same signature, so
+    nothing here branches on which venue it is.
     """
+    exchange_id = credential.get("exchange")
     account_type = credential.get("account_type")
     portfolio_uuid = credential.get("portfolio_uuid")
 
-    since = get_last_synced_timestamp(participant_id, account_type)
-    orders = closed_orders(exchange, since=since, portfolio_uuid=portfolio_uuid)
+    since = get_last_synced_timestamp(participant_id, exchange_id, account_type)
+    orders = venue.closed_orders(exchange, since=since, portfolio_uuid=portfolio_uuid)
 
     if not orders:
         return 0
 
     for order in orders:
         order["participant_id"] = participant_id
-        # The CREDENTIAL is authoritative, not the order's product_type.
-        # Orders are fetched with a portfolio-scoped key, so they can only
-        # come from that venue - whereas Coinbase labels INTX perpetuals
+        # The CREDENTIAL is authoritative, not anything the order says about
+        # itself. Orders are fetched with a venue-scoped key, so they can only
+        # have come from that venue - whereas Coinbase labels INTX perpetuals
         # 'FUTURE' with no contract_expiry_type, which reads as a dated
-        # future. Storing them under a different account_type than the one
+        # future. Storing a row under different venue columns than the ones
         # get_last_synced_timestamp() queries makes the resume point invisible
         # and re-fetches the whole history every run.
+        order["exchange"] = exchange_id
         order["account_type"] = account_type
 
     response = supabase.table("trade_metrics").upsert(
         orders,
-        on_conflict="participant_id,account_type,order_id",
+        on_conflict="participant_id,exchange,account_type,order_id",
         ignore_duplicates=False,
     ).execute()
 
@@ -142,18 +176,19 @@ def sync_orders(participant_id, credential: dict, exchange) -> int:
     return len(response.data or [])
 
 
-def sync_balance_snapshot(participant_id, credential: dict, exchange) -> None:
+def sync_balance_snapshot(participant_id, credential: dict, exchange, venue) -> None:
     """
     Record one point on this credential's equity curve.
 
-    Both the spot and perp valuations return a 'total_usdc' headline figure,
-    so they store identically; whatever else each returns is kept in `detail`
+    Every venue's valuation returns a 'total_usdc' headline figure, so they
+    all store identically; whatever else each returns is kept in `detail`
     rather than discarded, since it can't be backfilled later.
     """
+    exchange_id = credential.get("exchange")
     account_type = credential.get("account_type")
     portfolio_uuid = credential.get("portfolio_uuid")
 
-    snapshot = get_account_totals_usdc(
+    snapshot = venue.get_account_totals_usdc(
         exchange,
         account_type=account_type,
         portfolio_uuid=portfolio_uuid,
@@ -163,18 +198,19 @@ def sync_balance_snapshot(participant_id, credential: dict, exchange) -> None:
               if k not in ("timestamp", "datetime", "account_type", "total_usdc")}
 
     # upsert, not insert: the table is unique on
-    # (participant_id, account_type, timestamp), so a retry landing on the
-    # same millisecond would otherwise raise instead of being a no-op.
+    # (participant_id, exchange, account_type, timestamp), so a retry landing
+    # on the same millisecond would otherwise raise instead of being a no-op.
     supabase.table("balance_snapshots").upsert({
         "participant_id": participant_id,
+        "exchange": exchange_id,
         "account_type": account_type,
         "timestamp": snapshot.get("timestamp"),
         "total_usdc": snapshot.get("total_usdc"),
         "detail": detail,
-    }, on_conflict="participant_id,account_type,timestamp").execute()
+    }, on_conflict="participant_id,exchange,account_type,timestamp").execute()
 
 
-def sync_cash_flows(participant_id, credential: dict, exchange) -> int:
+def sync_cash_flows(participant_id, credential: dict, exchange, venue) -> int:
     """
     Record external deposits and withdrawals for one credential.
 
@@ -183,36 +219,42 @@ def sync_cash_flows(participant_id, credential: dict, exchange) -> int:
     transfers are internal happens in the metrics layer, where a participant's
     venues can be compared against each other.
     """
+    exchange_id = credential.get("exchange")
     account_type = credential.get("account_type")
+    portfolio_uuid = credential.get("portfolio_uuid")
 
-    since = get_last_flow_timestamp(participant_id, account_type)
-    flows = get_cash_flows(exchange, since=since)
+    since = get_last_flow_timestamp(participant_id, exchange_id, account_type)
+    flows = venue.get_cash_flows(exchange, since=since,
+                                 portfolio_uuid=portfolio_uuid)
 
     if not flows:
         return 0
 
     for flow in flows:
         flow["participant_id"] = participant_id
+        flow["exchange"] = exchange_id
         flow["account_type"] = account_type
 
     response = supabase.table("cash_flows").upsert(
         flows,
-        on_conflict="participant_id,account_type,transfer_id",
+        on_conflict="participant_id,exchange,account_type,transfer_id",
         ignore_duplicates=False,
     ).execute()
 
     return len(response.data or [])
 
 
-def get_last_flow_timestamp(participant_id, account_type: str) -> int:
+def get_last_flow_timestamp(participant_id, exchange: str, account_type: str) -> int:
     """
     Resume point for this credential's transfer history, mirroring
-    get_last_synced_timestamp for orders.
+    get_last_synced_timestamp for orders - and keyed on the venue for the
+    same reason.
     """
     response = (
         supabase.table("cash_flows")
         .select("timestamp")
         .eq("participant_id", participant_id)
+        .eq("exchange", exchange)
         .eq("account_type", account_type)
         .order("timestamp", desc=True)
         .limit(1)
@@ -317,63 +359,79 @@ def sync_all_to_supabase() -> dict:
         participant_id = participant.get("id")
 
         for credential in get_api_keys(participant_id):
+            exchange_id = credential.get("exchange") or "coinbase"
             account_type = credential.get("account_type")
+            label = f"{exchange_id}/{account_type}"
 
-            if not credential.get("api_key") or not credential.get("api_secret"):
+            # api_secret is deliberately NOT required: Lighter authenticates
+            # with a single value in api_key, so demanding a pair here would
+            # skip every Lighter credential in silence.
+            if not credential.get("api_key"):
                 # A registration problem rather than a sync failure, but not
                 # silent either - an active row with no key never syncs.
                 skipped += 1
                 logger.warning("%s (%s): active credential row has no key stored",
-                               participant_id, account_type)
+                               participant_id, label)
+                continue
+
+            venue = VENUES.get(exchange_id)
+            if venue is None:
+                # Registered against an exchange with no adapter. Counted as a
+                # failure rather than skipped: someone signed up expecting to
+                # be scored, and silently omitting them from the leaderboard
+                # is the worst available outcome.
+                attempted += 1
+                failed += 1
+                task_failures += 1
+                log_fetch_error(
+                    participant_id,
+                    ValueError(f"No adapter for exchange '{exchange_id}' - "
+                               f"known venues are {sorted(VENUES)}"),
+                    label,
+                )
                 continue
 
             attempted += 1
 
             try:
-                exchange = build_exchange(
-                    credential["api_key"],
-                    credential["api_secret"],
-                    credential.get("exchange") or "coinbase",
-                    passphrase=credential.get("api_passphrase"),
-                    portfolio_uuid=credential.get("portfolio_uuid"),
-                )
+                exchange = venue.build_from_credential(credential)
             except Exception as e:
                 # Can't build the client - nothing else is possible for this row
                 task_failures += 1
                 failed += 1
-                log_fetch_error(participant_id, e, account_type)
+                log_fetch_error(participant_id, e, label)
                 continue
 
             # Orders and balances are independent. A malformed order or a
             # constraint violation shouldn't also cost this participant their
             # equity curve point - that datum can't be backfilled later.
             try:
-                written = sync_orders(participant_id, credential, exchange)
+                written = sync_orders(participant_id, credential, exchange, venue)
                 total_orders += written
-                logger.info("%s (%s): %d orders", participant_id, account_type, written)
+                logger.info("%s (%s): %d orders", participant_id, label, written)
             except Exception as e:
                 task_failures += 1
-                log_fetch_error(participant_id, e, account_type)
+                log_fetch_error(participant_id, e, label)
 
             try:
-                sync_balance_snapshot(participant_id, credential, exchange)
+                sync_balance_snapshot(participant_id, credential, exchange, venue)
                 total_snapshots += 1
-                logger.info("%s (%s): snapshot recorded", participant_id, account_type)
+                logger.info("%s (%s): snapshot recorded", participant_id, label)
             except Exception as e:
                 # The unrecoverable one - see the docstring.
                 task_failures += 1
                 failed += 1
-                log_fetch_error(participant_id, e, account_type)
+                log_fetch_error(participant_id, e, label)
 
             try:
-                moved = sync_cash_flows(participant_id, credential, exchange)
+                moved = sync_cash_flows(participant_id, credential, exchange, venue)
                 total_flows += moved
                 if moved:
                     logger.info("%s (%s): %d cash flow(s)",
-                                participant_id, account_type, moved)
+                                participant_id, label, moved)
             except Exception as e:
                 task_failures += 1
-                log_fetch_error(participant_id, e, account_type)
+                log_fetch_error(participant_id, e, label)
 
     logger.info("Done: %d orders upserted, %d snapshots recorded, %d cash "
                 "flow(s). %d of %d credential(s) failed, %d step(s) failed in "

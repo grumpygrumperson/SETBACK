@@ -78,7 +78,7 @@ def fetch_snapshots(participant_id: str) -> list[dict]:
     """
     response = (
         supabase.table("balance_snapshots")
-        .select("account_type,timestamp,total_usdc")
+        .select("exchange,account_type,timestamp,total_usdc")
         .eq("participant_id", participant_id)
         .order("timestamp")
         .execute()
@@ -92,12 +92,24 @@ def fetch_cash_flows(participant_id: str) -> list[dict]:
     """
     response = (
         supabase.table("cash_flows")
-        .select("account_type,timestamp,usdc_value,direction,currency,amount")
+        .select("exchange,account_type,timestamp,usdc_value,direction,currency,amount")
         .eq("participant_id", participant_id)
         .order("timestamp")
         .execute()
     )
     return response.data or []
+
+
+def _venue_of(row: dict) -> tuple[str, str]:
+    """
+    The venue a stored row came from: (exchange, account_type).
+
+    account_type alone stopped identifying a venue once a second exchange
+    appeared - Coinbase INTX and Lighter both report 'perp'. Rows written
+    before the exchange column existed are Coinbase, since it was the only
+    venue then.
+    """
+    return (row.get("exchange") or "coinbase", row.get("account_type"))
 
 
 def mark_internal_transfers(flows: list[dict], window_ms: int = 3_600_000,
@@ -128,7 +140,13 @@ def mark_internal_transfers(flows: list[dict], window_ms: int = 3_600_000,
                 continue
             if b["timestamp"] - a["timestamp"] > window_ms:
                 break                       # sorted, so nothing later can match
-            if a["account_type"] == b["account_type"]:
+            # Different VENUE, not merely a different account_type. Coinbase
+            # INTX and Lighter are both 'perp', so comparing account_type
+            # alone would refuse to pair a transfer between them - booking one
+            # real deposit and one real withdrawal for money that never left
+            # the participant's control, and corrupting the returns of
+            # precisely the people who use both venues.
+            if _venue_of(a) == _venue_of(b):
                 continue
             if a["direction"] == b["direction"]:
                 continue
@@ -265,7 +283,13 @@ def build_portfolio_series(snapshots: list[dict], period: str = "daily",
         if value is None:
             continue
         key = _period_key(snap["timestamp"], period)
-        by_period.setdefault(key, {})[snap["account_type"]] = float(value)
+        # Keyed by (exchange, account_type), not account_type alone. Coinbase
+        # INTX and Lighter are both 'perp', so bucketing by account_type would
+        # let one overwrite the other and drop a whole venue from the
+        # participant's equity curve - silently, and looking exactly like a
+        # loss of that size.
+        venue = (snap.get("exchange") or "coinbase", snap["account_type"])
+        by_period.setdefault(key, {})[venue] = float(value)
 
     if not by_period:
         return [], {}

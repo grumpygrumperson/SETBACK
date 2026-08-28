@@ -19,3 +19,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 os.environ.setdefault("SUPABASE_URL", "https://placeholder.supabase.co")
 os.environ.setdefault("SUPABASE_KEY", "placeholder-key-for-tests")
+
+# A throwaway cipher key for the encryption round-trip tests. Set BEFORE the
+# modules import: load_dotenv() does not override variables that already
+# exist, so this keeps the suite off the real FERNET_KEY even on a machine
+# that has one.
+if not os.environ.get("FERNET_KEY"):
+    from cryptography.fernet import Fernet
+    os.environ["FERNET_KEY"] = Fernet.generate_key().decode()
