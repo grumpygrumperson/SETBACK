@@ -72,32 +72,95 @@ _PERIOD_STEPS = {
 _MAX_YEARS = 5
 
 
+# PostgREST caps how many rows one request may return (Supabase's `max-rows`
+# setting). It applies the cap SILENTLY - the response is a normal 200 with
+# fewer rows, not an error - so an unpaginated select looks like it worked
+# and simply omits the rest.
+#
+# That is worse here than it sounds. Snapshots are read oldest-first, so a
+# truncated read keeps the OLDEST rows: every participant's Sharpe would be
+# computed from a frozen window that stops advancing, and would keep looking
+# plausible while doing it. The sync writes one snapshot per credential per
+# run - around 500 rows a day at today's size - so this is a matter of weeks,
+# not a theoretical limit.
+_PAGE_SIZE = 1000
+
+# Refuse to walk more than this many rows for one participant. A participant
+# with a million snapshots is a bug, not a trader, and pulling it would take
+# the whole metrics run down with it.
+_MAX_FETCH_ROWS = 500_000
+
+
+def _fetch_all(build_query, label: str) -> list[dict]:
+    """
+    Run a select to completion, page by page.
+
+    Steps by the number of rows actually RETURNED rather than by the page
+    size asked for. That matters: if the server's cap is lower than
+    _PAGE_SIZE, a fixed stride would skip everything between the cap and the
+    stride - reading a fraction of the table while looking like a full scan.
+
+    `build_query` is a callable returning a fresh query, because a PostgREST
+    query object cannot be re-ranged once executed.
+    """
+    rows: list[dict] = []
+    start = 0
+
+    while True:
+        page = (build_query()
+                .range(start, start + _PAGE_SIZE - 1)
+                .execute().data) or []
+        if not page:
+            break
+
+        rows.extend(page)
+        start += len(page)
+
+        if start >= _MAX_FETCH_ROWS:
+            logger.warning(
+                "Stopped reading %s at %d rows - refusing to pull more for a "
+                "single participant. The metric below is computed on a "
+                "truncated history.", label, start
+            )
+            break
+
+    return rows
+
+
 def fetch_snapshots(participant_id: str) -> list[dict]:
     """
     All of a participant's balance snapshots, every venue, oldest first.
+
+    Ordered by id as well as timestamp. Two venues written in the same
+    millisecond would otherwise have no defined order between them, and rows
+    can shift between pages under an ambiguous sort - dropping one and
+    repeating another.
     """
-    response = (
-        supabase.table("balance_snapshots")
-        .select("exchange,account_type,timestamp,total_usdc")
-        .eq("participant_id", participant_id)
-        .order("timestamp")
-        .execute()
+    return _fetch_all(
+        lambda: (supabase.table("balance_snapshots")
+                 .select("exchange,account_type,timestamp,total_usdc")
+                 .eq("participant_id", participant_id)
+                 .order("timestamp").order("id")),
+        f"balance_snapshots for {participant_id}",
     )
-    return response.data or []
 
 
 def fetch_cash_flows(participant_id: str) -> list[dict]:
     """
     All recorded transfers for a participant, every venue, oldest first.
+
+    mark_internal_transfers() relies on this ordering to stop scanning once
+    it is past the pairing window, so the sort is load-bearing rather than
+    cosmetic.
     """
-    response = (
-        supabase.table("cash_flows")
-        .select("exchange,account_type,timestamp,usdc_value,direction,currency,amount")
-        .eq("participant_id", participant_id)
-        .order("timestamp")
-        .execute()
+    return _fetch_all(
+        lambda: (supabase.table("cash_flows")
+                 .select("exchange,account_type,timestamp,usdc_value,"
+                         "direction,currency,amount")
+                 .eq("participant_id", participant_id)
+                 .order("timestamp").order("id")),
+        f"cash_flows for {participant_id}",
     )
-    return response.data or []
 
 
 def _venue_of(row: dict) -> tuple[str, str]:
@@ -149,6 +212,13 @@ def mark_internal_transfers(flows: list[dict], window_ms: int = 3_600_000,
             if _venue_of(a) == _venue_of(b):
                 continue
             if a["direction"] == b["direction"]:
+                continue
+
+            # usdc_value is nullable - a transfer in a currency that could
+            # not be priced stores NULL rather than a wrong number. float(None)
+            # would raise and cost this participant their whole Sharpe, so an
+            # unpriceable transfer is simply not pairable.
+            if a["usdc_value"] is None or b["usdc_value"] is None:
                 continue
 
             size_a, size_b = abs(float(a["usdc_value"])), abs(float(b["usdc_value"]))
