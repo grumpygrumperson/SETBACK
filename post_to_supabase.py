@@ -1,6 +1,7 @@
 import logging
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from supabase import create_client
 from dotenv import load_dotenv
 
@@ -46,9 +47,12 @@ def get_active_participants() -> list[dict]:
 
 def get_api_keys(participant_id) -> list[dict]:
     """
-    Fetch a participant's active credential rows - one per venue, so a
+    Fetch one participant's active credential rows - one per venue, so a
     participant trading both spot and perps comes back as two rows, each
     carrying its own passphrase and portfolio UUID.
+
+    The sync itself uses get_all_api_keys(); this stays for ad hoc use on a
+    single participant.
     """
     response = (
         supabase.table("participant_api_keys")
@@ -58,6 +62,42 @@ def get_api_keys(participant_id) -> list[dict]:
         .execute()
     )
     return response.data or []
+
+
+def get_all_api_keys() -> dict[str, list[dict]]:
+    """
+    Every active credential in the competition, grouped by participant_id.
+
+    One request instead of one per participant. The per-participant query was
+    an N+1: at 200 participants the sync opened 200 round trips to Supabase
+    before touching a single exchange, and each costs ~0.2s of pure latency
+    whatever the row count. Grouping in memory is free by comparison, and the
+    whole table is a few hundred small rows.
+
+    Note this reads credentials for participants the loop may skip. That is
+    fine - they are already encrypted, and get_active_participants() decides
+    who is processed.
+    """
+    # Ordered, and not merely for tidiness. _plan_credential_work() picks the
+    # FIRST credential of an account-wide venue to collect that participant's
+    # transfers; without an ORDER BY, PostgREST returns rows in Postgres'
+    # physical order, which shifts whenever a row is updated - so the winner
+    # could change between runs. See get_last_flow_timestamp() for why that
+    # used to matter and no longer does.
+    response = (
+        supabase.table("participant_api_keys")
+        .select("*")
+        .eq("is_active", True)
+        .order("exchange")
+        .order("account_type")
+        .order("id")
+        .execute()
+    )
+
+    by_participant: dict[str, list[dict]] = {}
+    for row in response.data or []:
+        by_participant.setdefault(row.get("participant_id"), []).append(row)
+    return by_participant
 
 
 def get_last_synced_timestamp(participant_id, exchange: str, account_type: str) -> int:
@@ -208,7 +248,14 @@ def sync_cash_flows(participant_id, credential: dict, exchange, venue) -> int:
     account_type = credential.get("account_type")
     portfolio_uuid = credential.get("portfolio_uuid")
 
-    since = get_last_flow_timestamp(participant_id, exchange_id, account_type)
+    # An account-wide history resumes from the newest transfer stored for this
+    # participant on this EXCHANGE, whichever credential happened to record
+    # it. See get_last_flow_timestamp().
+    account_wide = getattr(venue, "CASH_FLOWS_ARE_ACCOUNT_WIDE", False)
+    since = get_last_flow_timestamp(
+        participant_id, exchange_id, None if account_wide else account_type
+    )
+
     flows = venue.get_cash_flows(exchange, since=since,
                                  portfolio_uuid=portfolio_uuid)
 
@@ -229,22 +276,40 @@ def sync_cash_flows(participant_id, credential: dict, exchange, venue) -> int:
     return len(response.data or [])
 
 
-def get_last_flow_timestamp(participant_id, exchange: str, account_type: str) -> int:
+def get_last_flow_timestamp(participant_id, exchange: str,
+                            account_type: str = None) -> int:
     """
-    Resume point for this credential's transfer history, mirroring
-    get_last_synced_timestamp for orders - and keyed on the venue for the
-    same reason.
+    Resume point for a transfer history, mirroring get_last_synced_timestamp
+    for orders.
+
+    `account_type=None` means "anywhere on this exchange", and that is the
+    right query for a venue whose transfer history covers the whole account.
+
+    Scoping it to one account_type there is a trap. Only ONE credential per
+    (participant, venue) collects account-wide transfers, and which one that
+    is depends on the order credentials come back in. If a run stored a
+    participant's Coinbase deposits under 'spot' and a later run collected
+    them under 'perp' - because they deactivated a key, registered another,
+    or the rows simply came back in a different order - the 'perp' lookup
+    would find no history, resume from the start of the competition, and
+    write every transfer a SECOND time. The unique key includes account_type,
+    so nothing would reject it, and flows_by_period() would then subtract
+    every deposit twice.
+
+    Ignoring account_type makes the resume point survive the winner changing.
+    Per-account venues like Lighter still pass their account_type, because
+    there each credential genuinely has its own separate history.
     """
-    response = (
+    query = (
         supabase.table("cash_flows")
         .select("timestamp")
         .eq("participant_id", participant_id)
         .eq("exchange", exchange)
-        .eq("account_type", account_type)
-        .order("timestamp", desc=True)
-        .limit(1)
-        .execute()
     )
+    if account_type is not None:
+        query = query.eq("account_type", account_type)
+
+    response = query.order("timestamp", desc=True).limit(1).execute()
 
     rows = response.data or []
     if rows and rows[0].get("timestamp") is not None:
@@ -311,39 +376,36 @@ def _failure_threshold() -> float:
     return value
 
 
-def sync_all_to_supabase() -> dict:
+def _plan_credential_work(participants: list[dict],
+                          credentials_by_participant: dict) -> tuple[list[dict], int]:
     """
-    For every participant, sync every venue they've registered.
+    Decide, before anything runs, exactly what each credential should do.
 
-    Each credential is handled independently: a participant's expired perp key
-    shouldn't cost them their spot sync, and no single participant's failure
-    should cost everyone else their run.
+    Two things are settled here rather than inside the sync so that the work
+    items are independent and can run in any order - or at the same time:
 
-    Returns a summary the caller uses to set an exit code. The run completing
-    is not the same as the run working, and on a scheduled host the exit code
-    is the only signal anything watches.
+      * which venue adapter handles each credential, and
+      * which ONE credential per (participant, venue) collects cash flows,
+        for venues whose transfer history covers the whole account.
 
-    A credential counts as FAILED when it produced no balance snapshot.
-    That's the line because the snapshot is the only datum that can't be
-    recovered later: orders and cash flows resume from their stored
-    timestamps on the next run, but the equity curve point for 12:15 is gone
-    for good. A credential whose orders failed while its snapshot succeeded
-    has lost nothing permanent, so it doesn't count against the threshold -
-    the error is still logged and still in fetch_errors either way.
+    That second decision cannot be made inside the workers. It is a
+    per-participant "has anyone done this yet", and two threads reaching it
+    together would both answer no - reintroducing exactly the duplicate
+    deposits the check exists to prevent. Settling it up front makes it
+    deterministic and needs no shared state at all.
+
+    Returns (work_items, skipped) where skipped counts active rows with no
+    key stored.
     """
-    participants = get_active_participants()
-    total_orders = 0
-    total_snapshots = 0
-    total_flows = 0
-    task_failures = 0        # every failed step, for reporting
-    attempted = 0            # credentials we had keys for
-    failed = 0               # credentials that produced no snapshot
-    skipped = 0              # rows with no key stored at all
+    work: list[dict] = []
+    skipped = 0
 
     for participant in participants:
         participant_id = participant.get("id")
+        rows = credentials_by_participant.get(participant_id, [])
+        flow_collector = _flow_collectors(rows)
 
-        for credential in get_api_keys(participant_id):
+        for credential in rows:
             exchange_id = credential.get("exchange") or "coinbase"
             account_type = credential.get("account_type")
             label = f"{exchange_id}/{account_type}"
@@ -368,69 +430,271 @@ def sync_all_to_supabase() -> dict:
                 # is the worst available outcome - worse still on a
                 # cross-exchange strategy, where the remaining venue reads as
                 # a naked position rather than one leg of a hedge.
-                attempted += 1
-                failed += 1
-                task_failures += 1
                 log_fetch_error(participant_id, e, label)
+                work.append({"participant_id": participant_id, "label": label,
+                             "unknown_venue": True})
                 continue
 
-            attempted += 1
+            # Some venues report transfers for the whole ACCOUNT rather than
+            # for the credential's own portfolio. Coinbase is one: its v2
+            # transactions endpoint returns the same history whichever
+            # portfolio's key asks, so a participant holding both a spot and
+            # a perp credential would have every deposit stored twice - once
+            # under each account_type - and the metrics layer subtracts both.
+            # A $1,000 deposit then reads as $2,000 of funding, and the
+            # participant's return is understated for the rest of the
+            # competition.
+            #
+            # Asking once per (participant, venue) also removed the single
+            # largest block of wasted requests in the run: the second
+            # credential re-walked the same per-currency transfer history the
+            # first had already fetched - 33 requests and 11.8s on one live
+            # account, to produce nothing.
+            account_wide = getattr(venue, "CASH_FLOWS_ARE_ACCOUNT_WIDE", False)
+            sync_flows = (not account_wide
+                          or flow_collector.get(exchange_id) is credential)
 
-            try:
-                exchange = venue.build_from_credential(credential)
-            except Exception as e:
-                # Can't build the client - nothing else is possible for this row
-                task_failures += 1
-                failed += 1
-                log_fetch_error(participant_id, e, label)
-                continue
+            work.append({
+                "participant_id": participant_id,
+                "credential": credential,
+                "venue": venue,
+                "label": label,
+                "sync_flows": sync_flows,
+            })
 
-            # Orders and balances are independent. A malformed order or a
-            # constraint violation shouldn't also cost this participant their
-            # equity curve point - that datum can't be backfilled later.
-            try:
-                written = sync_orders(participant_id, credential, exchange, venue)
-                total_orders += written
-                logger.info("%s (%s): %d orders", participant_id, label, written)
-            except Exception as e:
-                task_failures += 1
-                log_fetch_error(participant_id, e, label)
+    return work, skipped
 
-            try:
-                sync_balance_snapshot(participant_id, credential, exchange, venue)
-                total_snapshots += 1
-                logger.info("%s (%s): snapshot recorded", participant_id, label)
-            except Exception as e:
-                # The unrecoverable one - see the docstring.
-                task_failures += 1
-                failed += 1
-                log_fetch_error(participant_id, e, label)
 
-            try:
-                moved = sync_cash_flows(participant_id, credential, exchange, venue)
-                total_flows += moved
-                if moved:
-                    logger.info("%s (%s): %d cash flow(s)",
-                                participant_id, label, moved)
-            except Exception as e:
-                task_failures += 1
-                log_fetch_error(participant_id, e, label)
+def _flow_collectors(credentials: list[dict]) -> dict:
+    """
+    For one participant, which credential collects each account-wide venue's
+    transfers. Keyed by exchange id; the value is the credential row itself.
+
+    Choosing has to be deliberate, because for some venues only ONE of a
+    participant's credentials can read the history at all. Coinbase's lives
+    behind the v2 transactions endpoint, reached with the ordinary Advanced
+    Trade key; an INTX perp key sees no v2 accounts and returns an empty
+    result that is indistinguishable from "never deposited". Handing the job
+    to that credential stops cash flow collection with no error, no failed
+    step, and a green run - and every participant's return silently stops
+    being adjusted for funding.
+
+    So the adapter names the account_type that can do it
+    (CASH_FLOWS_ACCOUNT_TYPE) and that credential is preferred. If the
+    participant hasn't registered one, the first credential for the venue is
+    used anyway: a venue that might answer beats one guaranteed not to be
+    asked.
+    """
+    collectors: dict = {}
+
+    for credential in credentials:
+        exchange_id = credential.get("exchange") or "coinbase"
+        if not credential.get("api_key"):
+            continue
+
+        try:
+            venue = venues.get(exchange_id)
+        except venues.UnknownVenue:
+            continue
+
+        if not getattr(venue, "CASH_FLOWS_ARE_ACCOUNT_WIDE", False):
+            continue
+
+        preferred = getattr(venue, "CASH_FLOWS_ACCOUNT_TYPE", None)
+        chosen = collectors.get(exchange_id)
+
+        if chosen is None:
+            collectors[exchange_id] = credential
+        elif (preferred is not None
+              and credential.get("account_type") == preferred
+              and chosen.get("account_type") != preferred):
+            collectors[exchange_id] = credential
+
+    return collectors
+
+
+def sync_one_credential(item: dict) -> dict:
+    """
+    Sync one credential, and never raise.
+
+    Every step is independently guarded and the outcome comes back as
+    counters, so this can be handed to a thread pool: a worker that raised
+    would take down the pool and cost everyone else their run, which is the
+    opposite of what the per-credential isolation is for.
+
+    Returned keys mirror the run summary - orders, snapshots, flows,
+    task_failures - plus `failed`, which is 1 when this credential produced
+    no balance snapshot. That is the line because the snapshot is the only
+    datum that cannot be recovered later: orders and cash flows resume from
+    their stored timestamps on the next run, but the equity curve point for
+    12:15 is gone for good.
+    """
+    result = {"orders": 0, "snapshots": 0, "flows": 0,
+              "task_failures": 0, "failed": 0}
+
+    participant_id = item["participant_id"]
+    label = item["label"]
+
+    if item.get("unknown_venue"):
+        result["task_failures"] = 1
+        result["failed"] = 1
+        return result
+
+    credential, venue = item["credential"], item["venue"]
+
+    try:
+        exchange = venue.build_from_credential(credential)
+    except Exception as e:
+        # Can't build the client - nothing else is possible for this row
+        result["task_failures"] += 1
+        result["failed"] = 1
+        log_fetch_error(participant_id, e, label)
+        return result
+
+    # Orders and balances are independent. A malformed order or a constraint
+    # violation shouldn't also cost this participant their equity curve point
+    # - that datum can't be backfilled later.
+    try:
+        written = sync_orders(participant_id, credential, exchange, venue)
+        result["orders"] = written
+        logger.info("%s (%s): %d orders", participant_id, label, written)
+    except Exception as e:
+        result["task_failures"] += 1
+        log_fetch_error(participant_id, e, label)
+
+    try:
+        sync_balance_snapshot(participant_id, credential, exchange, venue)
+        result["snapshots"] = 1
+        logger.info("%s (%s): snapshot recorded", participant_id, label)
+    except Exception as e:
+        # The unrecoverable one - see the docstring.
+        result["task_failures"] += 1
+        result["failed"] = 1
+        log_fetch_error(participant_id, e, label)
+
+    if item.get("sync_flows", True):
+        try:
+            moved = sync_cash_flows(participant_id, credential, exchange, venue)
+            result["flows"] = moved
+            if moved:
+                logger.info("%s (%s): %d cash flow(s)",
+                            participant_id, label, moved)
+        except Exception as e:
+            result["task_failures"] += 1
+            log_fetch_error(participant_id, e, label)
+    else:
+        logger.debug("%s (%s): cash flows already collected for this venue",
+                     participant_id, label)
+
+    return result
+
+
+# How many credentials to sync at once. Almost all of a run is spent waiting
+# on exchange HTTP, so threads are the right tool here even under the GIL.
+#
+# Measured against live accounts: 5 credentials took 34.0s serially and 19.0s
+# at 8 workers. The gain is capped there only because one participant's
+# transfer history dominates and there is nothing left to overlap it with -
+# the more participants there are, the better this scales, which is exactly
+# the direction the competition grows.
+#
+# Each credential builds its OWN ccxt instance, so ccxt's rate limiter (which
+# is per-instance and not thread-safe) is never shared between threads. The
+# only shared state is the market and ticker cache in venue_common, which
+# takes a lock.
+#
+# Set SYNC_WORKERS=1 for a strictly serial run.
+_DEFAULT_WORKERS = 8
+
+
+def _worker_count(work_items: int) -> int:
+    """
+    How many threads to use, from SYNC_WORKERS, clamped to something sane.
+
+    Never more threads than there is work, and never fewer than one. A bad
+    value falls back to the default rather than taking down the run - the
+    sync working matters more than the concurrency being exactly as asked.
+    """
+    raw = os.getenv("SYNC_WORKERS")
+    workers = _DEFAULT_WORKERS
+
+    if raw:
+        try:
+            workers = int(raw)
+        except ValueError:
+            logger.warning("SYNC_WORKERS=%r is not an integer - using %d",
+                           raw, _DEFAULT_WORKERS)
+        else:
+            if workers < 1:
+                logger.warning("SYNC_WORKERS=%d is below 1 - using 1", workers)
+                workers = 1
+
+    return max(1, min(workers, work_items))
+
+
+def sync_all_to_supabase() -> dict:
+    """
+    For every participant, sync every venue they've registered.
+
+    Each credential is handled independently: a participant's expired perp key
+    shouldn't cost them their spot sync, and no single participant's failure
+    should cost everyone else their run. That independence is what lets the
+    credentials run concurrently - see sync_one_credential().
+
+    Returns a summary the caller uses to set an exit code. The run completing
+    is not the same as the run working, and on a scheduled host the exit code
+    is the only signal anything watches.
+
+    A credential counts as FAILED when it produced no balance snapshot. That
+    is the line because the snapshot is the only datum that can't be recovered
+    later: orders and cash flows resume from their stored timestamps on the
+    next run, but the equity curve point for 12:15 is gone for good. A
+    credential whose orders failed while its snapshot succeeded has lost
+    nothing permanent, so it doesn't count against the threshold - the error
+    is still logged and still in fetch_errors either way.
+    """
+    participants = get_active_participants()
+    credentials_by_participant = get_all_api_keys()
+
+    work, skipped = _plan_credential_work(participants, credentials_by_participant)
+
+    totals = {"orders": 0, "snapshots": 0, "flows": 0,
+              "task_failures": 0, "failed": 0}
+
+    if work:
+        workers = _worker_count(len(work))
+        logger.info("Syncing %d credential(s) with %d worker(s)",
+                    len(work), workers)
+
+        if workers == 1:
+            results = [sync_one_credential(item) for item in work]
+        else:
+            with ThreadPoolExecutor(max_workers=workers,
+                                    thread_name_prefix="sync") as pool:
+                results = list(pool.map(sync_one_credential, work))
+
+        for result in results:
+            for key in totals:
+                totals[key] += result[key]
+
+    attempted = len(work)
 
     logger.info("Done: %d orders upserted, %d snapshots recorded, %d cash "
                 "flow(s). %d of %d credential(s) failed, %d step(s) failed in "
                 "total, %d row(s) skipped for having no key.",
-                total_orders, total_snapshots, total_flows,
-                failed, attempted, task_failures, skipped)
+                totals["orders"], totals["snapshots"], totals["flows"],
+                totals["failed"], attempted, totals["task_failures"], skipped)
 
     return {
         "attempted": attempted,
-        "failed": failed,
-        "task_failures": task_failures,
+        "failed": totals["failed"],
+        "task_failures": totals["task_failures"],
         "skipped": skipped,
-        "orders": total_orders,
-        "snapshots": total_snapshots,
-        "flows": total_flows,
+        "orders": totals["orders"],
+        "snapshots": totals["snapshots"],
+        "flows": totals["flows"],
     }
+
 
 
 if __name__ == "__main__":

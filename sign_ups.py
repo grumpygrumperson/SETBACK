@@ -1,7 +1,7 @@
+import csv
 import logging
 import os
 
-import pandas as pd
 from supabase import create_client
 from dotenv import load_dotenv
 
@@ -15,6 +15,17 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+# Named here rather than left to fail inside the library. Getting the
+# environment wrong is the most common way this script goes wrong, and
+# create_client's own error doesn't say which variable was missing.
+_missing = [n for n in ("SUPABASE_URL", "SUPABASE_KEY") if not os.getenv(n)]
+if _missing:
+    raise RuntimeError(
+        "Missing required environment variable(s): " + ", ".join(_missing) +
+        ". Set them in your .env. FERNET_KEY is also required, and must be "
+        "the same key the sync uses, or nothing registered here will decrypt."
+    )
+
 supabase = create_client(os.getenv("SUPABASE_URL"),
                          os.getenv("SUPABASE_KEY"))
 
@@ -24,15 +35,20 @@ def _clean(value) -> str:
     """
     Read one CSV cell, treating blanks as absent.
 
-    pandas turns an empty CSV field into float('nan'), and nan is TRUTHY - so
-    the obvious `row.get(col) or None` keeps it, and str(nan) then gets stored
-    as the literal string "nan". That is exactly what happened to
-    api_passphrase: every Coinbase row here held an encrypted "nan".
+    This used to be load-bearing against pandas: pandas turns an empty CSV
+    field into float('nan'), and nan is TRUTHY - so the obvious
+    `row.get(col) or None` keeps it, and str(nan) then gets stored as the
+    literal string "nan". That is exactly what happened to api_passphrase:
+    every Coinbase row here held an encrypted "nan".
 
     It did no harm only because ccxt.coinbase ignores `password`. On
     coinbaseexchange or coinbaseinternational, which require it, the venue
     would have been handed "nan" as the passphrase and failed to authenticate
     with nothing to say why.
+
+    The reader is now csv.DictReader, which yields plain strings and cannot
+    produce a nan at all - but this stays, because it also strips whitespace
+    and still catches a "nan" written into a CSV by whatever exported it.
     """
     if value is None:
         return None
@@ -127,11 +143,23 @@ def import_signups(path: str = SIGNUPS_CSV) -> None:
     """
     Import every row of the signup CSV. One bad row is reported and skipped
     rather than aborting the whole import.
+
+    Read with the standard library rather than pandas. pandas was the only
+    thing pulling ~60MB of NumPy into a deploy that never runs this file -
+    the Railway service starts post_to_supabase.py - and its nan-for-blank
+    behaviour is what put an encrypted literal "nan" into every Coinbase
+    passphrase. DictReader yields plain strings, so a blank cell is just "".
+
+    utf-8-sig because a CSV exported from Excel starts with a byte-order
+    mark, which would otherwise become part of the first column's NAME and
+    make row["username"] a KeyError on every row.
     """
-    signups = pd.read_csv(path)
+    with open(path, newline="", encoding="utf-8-sig") as handle:
+        signups = list(csv.DictReader(handle))
+
     imported = 0
 
-    for _, row in signups.iterrows():
+    for row in signups:
         try:
             details = verify_and_describe(row)
             participant_id = register_participant(row)
