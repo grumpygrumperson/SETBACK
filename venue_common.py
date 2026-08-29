@@ -13,6 +13,7 @@ them, none of them defines them.
 
 import logging
 import os
+import threading
 
 from cryptography.fernet import Fernet, MultiFernet
 from dotenv import load_dotenv
@@ -122,6 +123,135 @@ def money_amount(field, default: float = 0.0) -> float:
         return float(field)
     except (TypeError, ValueError):
         return default
+
+
+# ---------------------------------------------------------------------------
+# Market data sharing
+# ---------------------------------------------------------------------------
+
+# Loaded market maps, keyed by ccxt exchange id. Markets are PUBLIC reference
+# data - the same product list for every participant - so they're fetched once
+# per process rather than once per credential.
+_markets_cache: dict = {}
+
+# The sync fetches credentials concurrently, so several threads reach a cold
+# cache at the same instant. Without this lock they all miss, all call
+# load_markets(), and the shared cache saves nothing on the very run where it
+# matters most - the first one. The lock is held across the fetch on purpose:
+# the losers wait ~2s once and then read the cache, instead of paying for
+# their own download.
+_cache_lock = threading.Lock()
+
+
+def load_shared_markets(exchange) -> None:
+    """
+    Give this instance the market map, reusing one already loaded for the
+    same exchange rather than fetching it again.
+
+    load_markets() costs 7 HTTP requests and ~2.3s on Coinbase (currencies,
+    crypto currencies, exchange rates, three pages of products, and the fee
+    summary). Paid once per credential that is 200 participants x 7 = 1,400
+    redundant requests per run, and roughly eight minutes of a fifteen-minute
+    cron spent re-downloading an identical product list.
+
+    Safe to share because markets are not account-scoped. The one
+    account-specific thing load_markets() picks up on Coinbase is the fee
+    tier it writes into market['taker']/['maker'] - and nothing here reads
+    those: Coinbase fees come from each order's own total_fees, and Lighter's
+    come from get_account_fee_tier(), which asks a private per-account
+    endpoint precisely because the market-level rate is only the Standard
+    default.
+
+    Cleared by clear_shared_markets(); a long-lived process should call that
+    periodically so a newly listed market eventually appears.
+    """
+    with _cache_lock:
+        cached = _markets_cache.get(exchange.id)
+        if cached is None:
+            exchange.load_markets()
+            _markets_cache[exchange.id] = (exchange.markets, exchange.currencies)
+            return
+
+        markets, currencies = cached
+
+    exchange.set_markets(markets, currencies)
+
+
+# Bulk ticker snapshots, keyed by ccxt exchange id: (fetched_at_ms, tickers).
+_tickers_cache: dict = {}
+
+# How long a price snapshot stays usable. Long enough that one sync run makes
+# a single call, short enough that a long-running process re-prices.
+_TICKER_TTL_MS = 5 * 60 * 1000
+
+
+def load_shared_tickers(exchange, max_age_ms: int = _TICKER_TTL_MS) -> dict:
+    """
+    One bulk price snapshot per exchange, shared by every participant.
+
+    Pricing a balance coin by coin means one fetch_ticker request each -
+    around 30 sequential HTTP calls for a participant holding 30 assets, and
+    it was the single largest cost in a sync. fetch_tickers() returns all 929
+    Coinbase symbols in one ~2s request, so the whole run costs one call
+    instead of thirty per credential.
+
+    It is also FAIRER, which matters more than the speed. Valuing each
+    participant with its own ticker calls means the first is priced at
+    12:00:01 and the last at 12:08:30 - eight minutes of market movement
+    separating people who are supposed to be ranked against each other. A
+    shared snapshot values everyone at the same instant.
+
+    Returns {} rather than raising if the bulk call fails, so callers fall
+    back to per-symbol lookups instead of losing the snapshot entirely.
+    """
+    if not exchange.has.get('fetchTickers'):
+        return {}
+
+    # Held across the fetch so a cold cache costs ONE bulk call however many
+    # threads arrive at once - and, just as importantly, so every participant
+    # in the run is priced from that single snapshot rather than from
+    # whichever concurrent fetch happened to land first.
+    with _cache_lock:
+        now = exchange.milliseconds()
+        cached = _tickers_cache.get(exchange.id)
+        if cached is not None:
+            fetched_at, tickers = cached
+            if now - fetched_at < max_age_ms:
+                return tickers
+
+        try:
+            tickers = exchange.fetch_tickers()
+        except Exception as e:
+            logger.warning("Bulk ticker fetch failed on %s, falling back to "
+                           "per-symbol pricing: %s", exchange.id, e)
+            return {}
+
+        _tickers_cache[exchange.id] = (now, tickers)
+        return tickers
+
+
+def clear_shared_tickers(exchange_id: str = None) -> None:
+    """Forget cached prices, for one exchange or all of them."""
+    with _cache_lock:
+        if exchange_id is None:
+            _tickers_cache.clear()
+        else:
+            _tickers_cache.pop(exchange_id, None)
+
+
+def clear_shared_markets(exchange_id: str = None) -> None:
+    """
+    Forget cached markets, for one exchange or all of them.
+
+    The sync is a short-lived process - it exits between cron runs, so the
+    cache never goes stale there. This exists for anything long-running, and
+    for tests.
+    """
+    with _cache_lock:
+        if exchange_id is None:
+            _markets_cache.clear()
+        else:
+            _markets_cache.pop(exchange_id, None)
 
 
 def resolve_since(exchange, since) -> int:
