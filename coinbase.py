@@ -8,7 +8,8 @@ from dotenv import load_dotenv
 # here any more: lighter.py used to import them from this module, which made
 # Coinbase a dependency of a Lighter-only sync.
 from venue_common import (COMPETITION_START, QUOTE_PRIORITY, USD_EQUIVALENTS,
-                          get_fernet, money_amount, resolve_since)
+                          get_fernet, load_shared_markets,
+                          load_shared_tickers, money_amount, resolve_since)
 
 load_dotenv()
 
@@ -182,13 +183,22 @@ def build_from_credential(credential: dict) -> ccxt.Exchange:
     optional passphrase, Lighter needs a single token - and this is the one
     place per venue where that difference lives.
     """
-    return build_exchange(
+    exchange = build_exchange(
         credential["api_key"],
         credential.get("api_secret"),
         credential.get("exchange") or "coinbase",
         passphrase=credential.get("api_passphrase"),
         portfolio_uuid=credential.get("portfolio_uuid"),
     )
+
+    # Prime the market map HERE, before any other call. ccxt calls
+    # load_markets() itself at the top of fetch_balance, fetch_closed_orders
+    # and the rest - so priming lazily inside those functions is too late:
+    # the first ccxt call of the sync has already paid for a full download.
+    # Doing it at construction is what actually makes the shared cache work.
+    load_shared_markets(exchange)
+
+    return exchange
 
 
 def price_balances_in_usdc(exchange: ccxt.Exchange, balances: dict = None, price_cache: dict = None) -> float:
@@ -201,13 +211,24 @@ def price_balances_in_usdc(exchange: ccxt.Exchange, balances: dict = None, price
     if price_cache is None:
         price_cache = {}
 
-    exchange.load_markets()  # cheap no-op if already loaded - safe to call standalone
+    # Shared across credentials: the product list is identical for every
+    # participant, and re-fetching it per credential is the single largest
+    # avoidable cost in the sync.
+    load_shared_markets(exchange)
 
     if balances is None:
         balance = exchange.fetch_balance(params={'v3': True})
         balances = balance.get('total') or {}
 
     markets = exchange.markets
+
+    # One bulk price snapshot for the whole run, instead of a fetch_ticker
+    # per coin per participant. Besides being ~30x fewer requests for a
+    # diversified holder, it values every participant at the SAME instant -
+    # per-coin calls spread a leaderboard's pricing over minutes of market
+    # movement.
+    tickers = load_shared_tickers(exchange)
+
     total_usdc_value = 0.0
 
     for coin, amount in balances.items(): # coin is a the key and amount is the value of the key in the dictionary, {coin: amount}.
@@ -226,11 +247,17 @@ def price_balances_in_usdc(exchange: ccxt.Exchange, balances: dict = None, price
             symbol = f"{coin}/{quote}" # i.e., SOL/USDT, ETH/USDC, etc.
             if symbol not in markets:
                 continue
-            try:
-                ticker = exchange.fetch_ticker(symbol)
-            except Exception as e:
-                logger.warning("Ticker error for %s: %s", symbol, e)
-                continue
+
+            ticker = tickers.get(symbol)
+            if ticker is None:
+                # Not in the bulk snapshot - a thinly traded market, or the
+                # bulk call failed. Ask for this one symbol rather than
+                # writing the holding off at zero.
+                try:
+                    ticker = exchange.fetch_ticker(symbol)
+                except Exception as e:
+                    logger.warning("Ticker error for %s: %s", symbol, e)
+                    continue
 
             last = ticker.get('last') or ticker.get('close') # get the last traded price or the closing price from the ticker
             if last:
@@ -351,6 +378,64 @@ def get_perp_account_value(exchange: ccxt.Exchange, portfolio_uuid: str = None) 
 # print(get_perp_account_value(exchange))
 
 
+# Coinbase's account list is paged. ccxt's fetch_balance asks for one page of
+# 250 and reads only that page - there is no cursor loop in it - so wallet 251
+# onwards is invisible and valued at zero.
+_ACCOUNTS_PAGE_LIMIT = 250
+
+# Refuse to walk more than this many pages. A participant with 25,000 wallets
+# is a bug or an attack, not a trader.
+_MAX_ACCOUNT_PAGES = 100
+
+
+def _wallet_totals(exchange: ccxt.Exchange, wallet_type: str) -> dict:
+    """
+    {coin: amount} for one wallet type, with NO silent truncation.
+
+    ccxt's fetch_balance sends limit=250 and parses a single page. Coinbase
+    creates a wallet per asset a participant has ever held or enabled, so an
+    active account passes 250 easily - and everything past the first page is
+    then absent from the balance with nothing to say so. That is money valued
+    at zero on the leaderboard, silently, and it gets worse the more assets a
+    participant trades.
+
+    The fast path is unchanged: one fetch_balance, and for almost every
+    participant `has_next` is false and we are done. Only an account that is
+    actually truncated pays for the extra pages.
+    """
+    balance = exchange.fetch_balance(params={'type': wallet_type, 'v3': True})
+    totals = dict(balance.get('total') or {})
+
+    info = balance.get('info') or {}
+    if not info.get('has_next'):
+        return totals
+
+    cursor = info.get('cursor')
+    pages = 1
+    while cursor and pages < _MAX_ACCOUNT_PAGES:
+        response = exchange.v3PrivateGetBrokerageAccounts(
+            {'limit': _ACCOUNTS_PAGE_LIMIT, 'cursor': cursor}
+        )
+        for account in response.get('accounts') or []:
+            available = money_amount((account.get('available_balance') or {}).get('value'))
+            held = money_amount((account.get('hold') or {}).get('value'))
+            code = ((account.get('available_balance') or {}).get('currency')
+                    or account.get('currency'))
+            if not code:
+                continue
+            totals[code] = (totals.get(code) or 0.0) + available + held
+
+        pages += 1
+        if not response.get('has_next'):
+            break
+        cursor = response.get('cursor')
+
+    logger.info("%s: %s wallet list spanned %d pages - ccxt reads only the "
+                "first, so the rest were fetched explicitly",
+                exchange.id, wallet_type, pages)
+    return totals
+
+
 def get_account_totals_usdc(exchange: ccxt.Exchange, account_type: str = 'spot',
                             portfolio_uuid: str = None) -> dict:
     """
@@ -379,7 +464,7 @@ def get_account_totals_usdc(exchange: ccxt.Exchange, account_type: str = 'spot',
     # guaranteed errors per participant per run if left in.
     WALLET_TYPES = exchange.options.get('walletTypes') or ['spot']
 
-    exchange.load_markets()
+    load_shared_markets(exchange)
     timestamp = exchange.milliseconds()
 
     account_totals = {
@@ -392,10 +477,11 @@ def get_account_totals_usdc(exchange: ccxt.Exchange, account_type: str = 'spot',
 
     price_cache: dict = {}
     seen_wallet_signatures = set()
+    held_currencies: set = set()
 
     for wallet_type in WALLET_TYPES:
         try:
-            balance = exchange.fetch_balance(params={'type': wallet_type, 'v3': True})
+            raw_total = _wallet_totals(exchange, wallet_type)
         except ccxt.NotSupported:
             logger.debug("%s: %s wallet type not supported", exchange.id, wallet_type)
             continue
@@ -407,7 +493,6 @@ def get_account_totals_usdc(exchange: ccxt.Exchange, account_type: str = 'spot',
             logger.warning("%s: unexpected error fetching %s balance: %s", exchange.id, wallet_type, e)
             continue
 
-        raw_total = balance.get('total') or {}
         active_balances = {
             coin: amount for coin, amount in raw_total.items() if coin and amount and amount > 0
         }
@@ -419,9 +504,15 @@ def get_account_totals_usdc(exchange: ccxt.Exchange, account_type: str = 'spot',
             continue
         seen_wallet_signatures.add(signature)
 
+        held_currencies.update(active_balances)
+
         wallet_total = price_balances_in_usdc(exchange, active_balances, price_cache)
         account_totals[f'{wallet_type}_total_usdc'] = wallet_total
         account_totals['total_usdc'] += wallet_total
+
+    # Leave the coins we just saw where _transfer_currencies can find them, so
+    # get_cash_flows doesn't re-paginate every wallet to learn the same thing.
+    exchange.options[_HELD_CURRENCIES_KEY] = sorted(held_currencies)
 
     return account_totals
 
@@ -693,7 +784,7 @@ def _price_at_usdc(exchange: ccxt.Exchange, coin: str, timestamp_ms: int,
     if bucket in price_cache:
         return price_cache[bucket]
 
-    exchange.load_markets()
+    load_shared_markets(exchange)
     for quote in QUOTE_PRIORITY:
         symbol = f"{coin}/{quote}"
         if symbol not in exchange.markets:
@@ -765,6 +856,45 @@ INTERNAL_ACTIVITY_TYPES = {
 }
 
 
+# Coinbase's transfer history is reported for the whole ACCOUNT, not per
+# portfolio - see the note in get_cash_flows(). A participant with both a spot
+# and a perp credential therefore gets the identical list of transfers from
+# each, and the sync would store every deposit twice: once under
+# account_type='spot' and once under 'perp'. The unique key includes
+# account_type, so nothing rejects it, and metrics.mark_internal_transfers()
+# only pairs OPPOSITE directions - two identical deposits never cancel. A
+# $1,000 deposit would be subtracted from the participant's returns as $2,000.
+#
+# The sync reads this flag and calls get_cash_flows() once per (participant,
+# exchange) rather than once per credential. Lighter sets it False: its
+# transfer history really is per account index, so each credential must be
+# asked separately.
+CASH_FLOWS_ARE_ACCOUNT_WIDE = True
+
+# ...and which of a participant's credentials can actually read it.
+#
+# Not just any of them. The history lives behind the v2 transactions endpoint,
+# which is reached through the ordinary Advanced Trade key. An INTX (perp) key
+# sees no v2 brokerage accounts at all, so asking it returns nothing - not an
+# error, just an empty result indistinguishable from "this participant has
+# never deposited".
+#
+# Without this, the planner picks whichever credential comes first and can
+# hand the job to the one credential guaranteed to fail at it. That is how
+# cash flow collection stops silently: no exception, no failed step, the run
+# still green, and every participant's return quietly no longer adjusted for
+# funding.
+CASH_FLOWS_ACCOUNT_TYPE = 'spot'
+
+
+# Where get_account_totals_usdc leaves the coins it just saw, so
+# _transfer_currencies doesn't have to ask for the same balance again. Stored
+# on the exchange INSTANCE, which the sync builds fresh per credential per
+# run - so the lifetime is exactly one credential's sync and it can never
+# leak one participant's holdings into another's.
+_HELD_CURRENCIES_KEY = '_setapi_held_currencies'
+
+
 def _transfer_currencies(exchange: ccxt.Exchange) -> list[str]:
     """
     Currencies worth asking Coinbase about when fetching transfers.
@@ -776,8 +906,19 @@ def _transfer_currencies(exchange: ccxt.Exchange) -> list[str]:
 
     The trade-off: a deposit of a coin that was later fully sold won't be
     seen, because it no longer shows in the balance.
+
+    Reuses the holdings get_account_totals_usdc already fetched, if it ran
+    first - which it does in the sync. fetch_balance() on Coinbase paginates
+    every wallet a participant owns, so calling it twice per credential was
+    the largest single cost in a run: 39 requests and 11.8s across five
+    credentials, roughly half of it this duplicate.
     """
     codes = {'USD', 'USDC'}
+
+    held = exchange.options.get(_HELD_CURRENCIES_KEY)
+    if held is not None:
+        codes.update(held)
+        return sorted(codes)
 
     try:
         balance = exchange.fetch_balance()
@@ -789,6 +930,41 @@ def _transfer_currencies(exchange: ccxt.Exchange) -> list[str]:
         logger.warning("Could not list held currencies, checking USD/USDC only: %s", e)
 
     return sorted(codes)
+
+
+def _account_index_is_usable(exchange: ccxt.Exchange) -> bool:
+    """
+    Load the account list once, and say whether per-currency transfer lookups
+    can work at all.
+
+    ccxt resolves `fetch_deposits_withdrawals(code=...)` by scanning
+    exchange.accounts for that currency's wallet, via load_accounts(). That
+    cache only engages when the list is NON-EMPTY:
+
+        if self.accounts:  return self.accounts
+        else:              self.accounts = self.fetch_accounts(params)
+
+    An INTX (perp) key sees no v3 brokerage accounts, so the list comes back
+    empty, nothing is cached, and EVERY currency re-downloads the whole list
+    before failing to find its wallet. Measured on one live perp credential:
+    33 identical /v3/brokerage/accounts requests and 11.8s - a quarter of the
+    entire run - to produce nothing.
+
+    Priming once here turns that into a single request and an early return.
+    """
+    try:
+        exchange.load_accounts()
+    except Exception as e:
+        logger.warning("Could not list Coinbase accounts, skipping per-currency "
+                       "transfer lookups: %s", e)
+        return False
+
+    if not exchange.accounts:
+        logger.debug("%s: no v3 brokerage accounts visible to this key - "
+                     "per-currency transfer lookups cannot resolve a wallet",
+                     exchange.id)
+        return False
+    return True
 
 
 def _paginate_transfers(exchange: ccxt.Exchange, code: str, since: int,
@@ -839,6 +1015,14 @@ def get_cash_flows(exchange: ccxt.Exchange, since=None, limit: int = 100,
         # Iterating every currency it lists would be hundreds of calls per
         # participant per run, so ask only about currencies they actually
         # hold, plus the dollar ones nearly all funding arrives in.
+        #
+        # Every one of those lookups needs a wallet UUID out of the account
+        # list. If that list is empty the loop cannot succeed for ANY
+        # currency, and running it anyway re-downloads the list once per
+        # currency - see _account_index_is_usable().
+        if not _account_index_is_usable(exchange):
+            return []
+
         raw = []
         for code in _transfer_currencies(exchange):
             try:
