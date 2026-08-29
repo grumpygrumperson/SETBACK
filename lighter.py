@@ -71,8 +71,8 @@ import time
 import ccxt
 from cryptography.fernet import InvalidToken
 from dotenv import load_dotenv
-from venue_common import (USD_EQUIVALENTS, get_fernet, money_amount,
-                          resolve_since)
+from venue_common import (USD_EQUIVALENTS, get_fernet, load_shared_markets,
+                          money_amount, resolve_since)
 
 load_dotenv()
 
@@ -90,6 +90,17 @@ EXCHANGE_ID = 'lighter'
 # Lighter settles everything in USDC and has no spot product, so a
 # participant's account_type is always this.
 ACCOUNT_TYPE = 'perp'
+
+# Whether one credential's transfer history covers the whole account or only
+# that credential's slice of it. False here: Lighter's deposit and withdrawal
+# endpoints are scoped to an account index, so every credential has to be
+# asked separately or its transfers are simply never seen.
+#
+# Coinbase sets this True - its v2 transactions endpoint answers for the
+# entire account whichever portfolio's key you ask with, so asking twice
+# returns the same deposits twice. See the note on
+# coinbase.CASH_FLOWS_ARE_ACCOUNT_WIDE.
+CASH_FLOWS_ARE_ACCOUNT_WIDE = False
 
 # ccxt raises NotSupported above this, and the message is unhelpful about
 # why. Checked here so a mis-pasted key fails at registration with something
@@ -402,11 +413,19 @@ def build_from_credential(credential: dict) -> ccxt.Exchange:
     """
     account_index = credential.get("portfolio_uuid")
 
-    return build_exchange(
+    exchange = build_exchange(
         credential["api_key"],
         encrypted=True,
         account_index=account_index,
     )
+
+    # Before any other call - ccxt loads markets itself at the top of
+    # fetch_balance and fetch_my_trades, so priming later is too late to
+    # save anything. Lighter lists ~241 markets; sharing them across
+    # participants makes every credential after the first free.
+    load_shared_markets(exchange)
+
+    return exchange
 
 
 def exchange_from_env() -> ccxt.Exchange:
