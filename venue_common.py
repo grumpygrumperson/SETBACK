@@ -14,6 +14,7 @@ them, none of them defines them.
 import logging
 import os
 import threading
+import time
 
 from cryptography.fernet import Fernet, MultiFernet
 from dotenv import load_dotenv
@@ -298,3 +299,163 @@ def resolve_since(exchange, since) -> int:
             "'2026-05-01T00:00:00Z'"
         )
     return since
+
+
+# ---------------------------------------------------------------------------
+# Aggregate rate limiting
+#
+# ccxt's rate limiter is PER INSTANCE, and the sync builds one instance per
+# credential so that a thread-unsafe limiter is never shared between threads.
+# That is the right call for safety, and it has a consequence the original
+# comment did not draw out: nothing then bounds the TOTAL request rate. Eight
+# workers each believe they own the venue's whole budget, so the sync
+# actually asks for eight times what ccxt thinks it is asking for, and the
+# real rate silently scales with SYNC_WORKERS.
+#
+#     coinbase   ccxt rateLimit   34 ms  ->  29.4 req/s per instance
+#     lighter    ccxt rateLimit 1000 ms  ->   1.0 req/s per instance
+#
+# Whether that is a violation depends on something not documented here:
+# venues that meter PER API KEY are unaffected, because every participant
+# brings their own key, while venues that meter per IP see one Railway
+# egress address making the whole run. Coinbase's private endpoints are
+# per-key. Lighter's are unconfirmed, and ccxt's conservative 1 req/s default
+# for it is the reason to be careful.
+#
+# So the property worth having is not a particular number - it is that the
+# number stops depending on SYNC_WORKERS. A shared throttle makes the whole
+# run behave as one client at a rate somebody chose, and tuning concurrency
+# no longer silently changes how hard a venue is hit.
+# ---------------------------------------------------------------------------
+
+# One throttle per ccxt exchange id, shared by every credential in the run.
+_throttles: dict = {}
+_throttle_lock = threading.Lock()
+
+
+class SharedThrottle:
+    """
+    A slot allocator that paces every thread through one venue.
+
+    Each caller reserves the next free instant under a lock, releases the
+    lock, and only then sleeps until its slot. Holding the lock across the
+    sleep would work too, but it would serialise the waiting as well as the
+    pacing - callers would wake in lock order rather than slot order, and a
+    thread that had already waited its turn could be overtaken.
+    """
+
+    def __init__(self, interval_s: float):
+        self.interval = interval_s
+        self._lock = threading.Lock()
+        self._next_slot = 0.0
+
+    def acquire(self) -> float:
+        """Wait for this caller's slot. Returns how long it waited."""
+        with self._lock:
+            slot = max(time.monotonic(), self._next_slot)
+            self._next_slot = slot + self.interval
+
+        delay = slot - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
+            return delay
+        return 0.0
+
+
+def _configured_rates() -> dict:
+    """
+    Per-venue request rates from SHARED_RATE_LIMIT, as {exchange_id: req/s}.
+
+    Format is `venue=requests_per_second`, comma separated:
+
+        SHARED_RATE_LIMIT=lighter=4,coinbase=25
+
+    One variable rather than one per venue so it stays greppable and stays
+    documented - .env.example is checked against os.getenv literals, and a
+    name built at runtime would slip past that check unnoticed.
+
+    A malformed entry is logged and skipped rather than raised: the sync
+    running at ccxt's default rate is better than the sync not running.
+    """
+    raw = os.getenv("SHARED_RATE_LIMIT", "").strip()
+    if not raw:
+        return {}
+
+    rates = {}
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        venue, _, value = entry.partition("=")
+        try:
+            rate = float(value)
+            if rate <= 0:
+                raise ValueError("must be positive")
+        except ValueError:
+            logger.warning("Ignoring malformed SHARED_RATE_LIMIT entry %r - "
+                           "expected venue=requests_per_second", entry)
+            continue
+        rates[venue.strip()] = rate
+
+    return rates
+
+
+def get_shared_throttle(exchange_id: str, default_interval_ms: float) -> SharedThrottle:
+    """
+    The throttle for one venue, created once and reused by every credential.
+
+    Defaults to ccxt's own rateLimit for the venue, so the whole run behaves
+    as a single well-behaved ccxt client no matter how many workers there
+    are. Raise it with SHARED_RATE_LIMIT once a venue's real ceiling is
+    known.
+    """
+    with _throttle_lock:
+        throttle = _throttles.get(exchange_id)
+        if throttle is not None:
+            return throttle
+
+        rate = _configured_rates().get(exchange_id)
+        interval = (1.0 / rate) if rate else (default_interval_ms / 1000.0)
+
+        throttle = SharedThrottle(interval)
+        _throttles[exchange_id] = throttle
+        logger.debug("Shared throttle for %s: %.0f ms between requests "
+                     "(%.1f req/s across the whole run)",
+                     exchange_id, interval * 1000, 1.0 / interval if interval else 0)
+        return throttle
+
+
+def install_shared_rate_limit(exchange) -> None:
+    """
+    Pace this instance against every other instance for the same venue.
+
+    Wraps Exchange.fetch, which is the single chokepoint every REST call
+    funnels through - fetch2, the implicit endpoints and the signed private
+    calls all reach the network there, so one wrapper covers paths that have
+    not been written yet.
+
+    ccxt's own limiter is left enabled. It handles spacing within an
+    instance; this handles spacing between them. Keeping both means removing
+    this does not silently unpace anything.
+    """
+    if getattr(exchange, "_shared_rate_limited", False):
+        return
+
+    throttle = get_shared_throttle(exchange.id, getattr(exchange, "rateLimit", 0) or 0)
+    if throttle.interval <= 0:
+        return
+
+    original = exchange.fetch
+
+    def fetch(*args, **kwargs):
+        throttle.acquire()
+        return original(*args, **kwargs)
+
+    exchange.fetch = fetch
+    exchange._shared_rate_limited = True
+
+
+def clear_shared_throttles() -> None:
+    """Forget every throttle. For tests, and for changing rates at runtime."""
+    with _throttle_lock:
+        _throttles.clear()

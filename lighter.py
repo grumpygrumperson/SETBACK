@@ -71,7 +71,8 @@ import time
 import ccxt
 from cryptography.fernet import InvalidToken
 from dotenv import load_dotenv
-from venue_common import (USD_EQUIVALENTS, get_fernet, load_shared_markets,
+from venue_common import (USD_EQUIVALENTS, get_fernet,
+                          install_shared_rate_limit, load_shared_markets,
                           money_amount, resolve_since)
 
 load_dotenv()
@@ -213,6 +214,12 @@ def build_exchange_from_token(token: str, encrypted: bool = True,
     account_index = details['account_index']
 
     exchange = ccxt.lighter({'enableRateLimit': True, **options})
+
+    # See venue_common: ccxt's limiter is per instance and the sync builds one
+    # per credential, so the aggregate rate would otherwise scale with the
+    # worker count. Lighter's ccxt default is a conservative 1 req/s, which
+    # makes it the venue where that matters most.
+    install_shared_rate_limit(exchange)
 
     # Both are read back out of options by create_auth() when the caller
     # doesn't pass them, which is the case on every fetch_* path here.
@@ -411,6 +418,7 @@ def build_exchange(private_key: str, encrypted: bool = True,
     }
 
     exchange = ccxt.lighter(config)
+    install_shared_rate_limit(exchange)
 
     # ccxt reads both out of options when the caller doesn't pass them.
     if account_index is not None:

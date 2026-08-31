@@ -496,3 +496,147 @@ def test_no_documented_env_var_is_dead():
     assert not dead, (
         f"documented in .env.example but read by nothing: {sorted(dead)}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Aggregate rate limiting
+#
+# ccxt's limiter is per instance and the sync builds one per credential, so
+# before this the run's real request rate was ccxt's rate multiplied by
+# SYNC_WORKERS - and changing the worker count silently changed how hard a
+# venue was hit. The property under test is that it no longer does.
+# ---------------------------------------------------------------------------
+
+class _ThrottledExchange:
+    """The parts of a ccxt instance the throttle touches."""
+
+    def __init__(self, exchange_id="coinbase", rate_limit_ms=20):
+        self.id = exchange_id
+        self.rateLimit = rate_limit_ms
+        self.calls = 0
+
+    def fetch(self, *args, **kwargs):
+        self.calls += 1
+        return "response"
+
+
+@pytest.fixture(autouse=True)
+def _clean_throttles():
+    """Each test gets a cold cache - throttles are process-wide by design."""
+    venue_common.clear_shared_throttles()
+    yield
+    venue_common.clear_shared_throttles()
+
+
+def test_every_credential_for_a_venue_shares_one_throttle():
+    """The whole point: one venue, one budget, however many instances."""
+    a, b = _ThrottledExchange("coinbase"), _ThrottledExchange("coinbase")
+    venue_common.install_shared_rate_limit(a)
+    venue_common.install_shared_rate_limit(b)
+
+    assert (venue_common.get_shared_throttle("coinbase", 20)
+            is venue_common.get_shared_throttle("coinbase", 20))
+
+
+def test_separate_venues_do_not_share_a_budget():
+    """Lighter being slow must not throttle Coinbase."""
+    assert (venue_common.get_shared_throttle("coinbase", 20)
+            is not venue_common.get_shared_throttle("lighter", 1000))
+
+
+def test_concurrent_requests_are_paced_across_threads():
+    """
+    Eight threads through one venue take at least as long as the venue's
+    budget allows - which is exactly what did NOT happen before, because
+    eight instances each kept their own independent clock.
+    """
+    interval = 0.02
+    throttle = venue_common.SharedThrottle(interval)
+
+    started = time.monotonic()
+    _run_together(lambda _: throttle.acquire(), list(range(8)))
+    elapsed = time.monotonic() - started
+
+    # Eight slots at `interval` apart: the first is free, the rest wait.
+    assert elapsed >= 7 * interval * 0.9, (
+        f"8 requests took {elapsed:.3f}s, under the {7 * interval:.3f}s the "
+        f"rate allows - the throttle is not pacing across threads"
+    )
+
+
+def test_each_caller_gets_its_own_slot():
+    """
+    Successive callers are spaced, not handed the same instant.
+
+    Asserted on elapsed time for SERIAL calls rather than on the wait each
+    concurrent caller measured. That earlier form passed alone and failed
+    under load, and it was right to: when threads arrive further apart than
+    the interval they each find a free slot and wait ~0, so the measured
+    waits legitimately bunch up. The property that actually matters - the
+    schedule advances by one interval per caller - does not depend on
+    arrival order at all.
+    """
+    interval = 0.02
+    throttle = venue_common.SharedThrottle(interval)
+
+    started = time.monotonic()
+    for _ in range(5):
+        throttle.acquire()
+    elapsed = time.monotonic() - started
+
+    # Five slots: the first is free, the remaining four are spaced.
+    assert elapsed >= 4 * interval * 0.9, (
+        f"5 serial acquires took {elapsed:.3f}s, under the "
+        f"{4 * interval:.3f}s the interval requires"
+    )
+
+
+def test_installing_wraps_fetch_and_passes_through():
+    exchange = _ThrottledExchange(rate_limit_ms=1)
+    venue_common.install_shared_rate_limit(exchange)
+
+    assert exchange.fetch("https://example.test", "GET") == "response"
+    assert exchange.calls == 1
+
+
+def test_installing_twice_does_not_double_throttle():
+    """
+    build_exchange is called once per credential, but nothing guarantees an
+    instance is never passed through twice - and a double wrapper would halve
+    the rate invisibly.
+    """
+    exchange = _ThrottledExchange(rate_limit_ms=1)
+    venue_common.install_shared_rate_limit(exchange)
+    wrapped_once = exchange.fetch
+
+    venue_common.install_shared_rate_limit(exchange)
+    assert exchange.fetch is wrapped_once
+
+
+def test_rate_can_be_raised_per_venue(monkeypatch):
+    """Once a venue's real ceiling is known, without a code change."""
+    monkeypatch.setenv("SHARED_RATE_LIMIT", "lighter=4,coinbase=25")
+    venue_common.clear_shared_throttles()
+
+    assert venue_common.get_shared_throttle("lighter", 1000).interval == pytest.approx(0.25)
+    assert venue_common.get_shared_throttle("coinbase", 34).interval == pytest.approx(0.04)
+
+
+def test_unconfigured_venue_falls_back_to_ccxt_rate(monkeypatch):
+    monkeypatch.setenv("SHARED_RATE_LIMIT", "lighter=4")
+    venue_common.clear_shared_throttles()
+
+    assert venue_common.get_shared_throttle("coinbase", 34).interval == pytest.approx(0.034)
+
+
+@pytest.mark.parametrize("bad", ["lighter", "lighter=", "lighter=nope",
+                                 "lighter=0", "lighter=-2"])
+def test_a_malformed_rate_is_skipped_not_fatal(monkeypatch, bad):
+    """
+    The sync running at ccxt's default beats the sync not running. A typo in
+    a Railway variable must not take down data collection.
+    """
+    monkeypatch.setenv("SHARED_RATE_LIMIT", bad)
+    venue_common.clear_shared_throttles()
+
+    assert venue_common.get_shared_throttle("lighter", 1000).interval == pytest.approx(1.0)

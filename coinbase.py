@@ -14,8 +14,9 @@ from dotenv import load_dotenv
 # carries venue_common's value rather than a redeclared copy of it.
 from venue_common import (COMPETITION_START,  # noqa: F401 - re-export, see above
                           QUOTE_PRIORITY, USD_EQUIVALENTS,
-                          get_fernet, load_shared_markets,
-                          load_shared_tickers, money_amount, resolve_since)
+                          get_fernet, install_shared_rate_limit,
+                          load_shared_markets, load_shared_tickers,
+                          money_amount, resolve_since)
 
 load_dotenv()
 
@@ -129,6 +130,12 @@ def build_exchange(api_key: str, api_secret: str, exchange_id: str = 'coinbase',
         config['password'] = passphrase  # ccxt's name for the passphrase
 
     exchange = getattr(ccxt, exchange_id)(config)
+
+    # Pace this instance against every other credential's instance. ccxt's
+    # own limiter only spaces requests WITHIN an instance, and the sync
+    # builds one per credential, so without this the run's real request rate
+    # is ccxt's rate times SYNC_WORKERS.
+    install_shared_rate_limit(exchange)
 
     if portfolio_uuid:
         exchange.options['portfolio'] = portfolio_uuid

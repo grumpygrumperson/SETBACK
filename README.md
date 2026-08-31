@@ -45,7 +45,7 @@ Three properties the design turns on:
 ```bash
 uv sync --dev                 # install, including test dependencies
 cp .env.example .env          # then fill in SUPABASE_URL, SUPABASE_KEY, FERNET_KEY
-uv run pytest -q              # 277 tests, no network needed
+uv run pytest -q              # 294 tests, no network needed
 ```
 
 Apply the schema by pasting **`migrations/schema.sql`** into the Supabase SQL
