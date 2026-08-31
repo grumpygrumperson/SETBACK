@@ -54,6 +54,28 @@ QUOTE_PRIORITY = ['USDC', 'USDT', 'USD', 'BUSD', 'FDUSD']
 # redeploy - e.g. COMPETITION_START=2020-01-01T00:00:00Z to pull full history.
 COMPETITION_START = os.getenv("COMPETITION_START", "2026-01-01T00:00:00Z")
 
+# When the competition ENDS. Unset means open-ended, which is the right
+# default for development and the wrong one for a competition with a prize.
+#
+# This bounds SCORING, not fetching. The distinction matters:
+#
+#   fetching   is bounded below by COMPETITION_START so the sync doesn't
+#              re-walk years of history, and is deliberately NOT bounded
+#              above - the cron keeps recording, which is what you want for
+#              an audit trail and for spotting a key that dies after the
+#              close.
+#
+#   scoring    is bounded at BOTH ends, because a leaderboard that keeps
+#              moving after the competition closes has no final result. With
+#              no end date, day 57's market movement silently rewrites the
+#              standings of a contest that already finished - and every
+#              participant's rank keeps drifting for as long as the cron
+#              runs.
+#
+# Set it to the last instant that counts, e.g.
+# COMPETITION_END=2026-10-27T00:00:00Z for a 56-day run from 2026-09-01.
+COMPETITION_END = os.getenv("COMPETITION_END") or None
+
 
 # ---------------------------------------------------------------------------
 # Credential encryption
