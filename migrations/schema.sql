@@ -5,17 +5,114 @@
 -- Supabase project, and safe to re-run on an existing one: every statement is
 -- guarded, so it converges on the same schema either way.
 --
--- Paste the whole file into the Supabase SQL editor and run it.
+-- Paste the whole file into the Supabase SQL editor and press Run. It is one
+-- transaction: either every statement applies or none does, so a failure
+-- halfway through cannot leave the database half-migrated. Re-running it is
+-- always safe.
 --
--- Six tables and one view:
+-- Seven tables and two views:
 --   participants          one row per person
 --   participant_api_keys  one row per venue (spot and perps use DIFFERENT keys)
 --   trade_metrics         closed orders, tagged by venue
 --   balance_snapshots     the equity curve
 --   cash_flows            external deposits/withdrawals, so returns mean something
 --   fetch_errors          per-credential sync failures
---   latest_balances       leaderboard: spot + perp + combined
+--   participant_scores    flow-adjusted Sharpe, what the ranking uses
+--   latest_balances       view: current equity, by venue
+--   leaderboard           view: the ranking
 -- ============================================================================
+
+
+begin;
+
+
+-- ---------------------------------------------------------------------------
+-- 0. Legacy value repair
+--
+-- Runs before any constraint is added, because ADD CONSTRAINT revalidates
+-- every existing row - and in a single-transaction file, one legacy row
+-- failing a check would roll back the entire migration.
+--
+-- Two kinds of legacy value exist, and they are repaired rather than
+-- rejected because both have exactly one correct answer:
+--
+--   account_type  Coinbase reports INTX perpetuals as product_type='FUTURE'
+--                 with contract_expiry_type=null, so an older classifier
+--                 stored them as 'future'. They are perpetuals; 'perp' is
+--                 what they should have said.
+--
+--   exchange      Every row written before multi-venue support is Coinbase.
+--                 It was the only venue that existed.
+--
+-- Anything that still does not fit afterwards is NOT guessed at. The final
+-- block raises with the table and the offending values named, which is a far
+-- more useful failure than PostgreSQL's bare 23514 with a constraint name.
+-- ---------------------------------------------------------------------------
+
+do $$
+declare
+  t  text;
+  bad text;
+begin
+  -- The tables may not exist yet on a fresh project; skip what isn't there.
+  foreach t in array array['participant_api_keys', 'trade_metrics',
+                           'balance_snapshots', 'cash_flows']
+  loop
+    if to_regclass('public.' || t) is null then
+      continue;
+    end if;
+
+    -- account_type: fold the known synonyms onto 'perp'
+    if exists (select 1 from information_schema.columns
+                where table_schema = 'public' and table_name = t
+                  and column_name = 'account_type') then
+      execute format(
+        'update public.%I set account_type = %L
+          where lower(account_type) in (%L, %L, %L, %L, %L)',
+        t, 'perp', 'future', 'futures', 'swap', 'perpetual', 'perps');
+
+      -- A null predates the column being populated at all, and everything
+      -- that old is spot - Coinbase perps came later. The original file did
+      -- this for trade_metrics further down; doing it here too means the
+      -- check below cannot fire on a row the old file handled fine.
+      execute format(
+        'update public.%I set account_type = ''spot'' where account_type is null', t);
+
+      execute format(
+        'select string_agg(distinct coalesce(account_type, ''<null>''), '', '')
+           from public.%I where account_type is null
+              or account_type not in (''spot'', ''perp'')', t)
+        into bad;
+
+      if bad is not null then
+        raise exception
+          'public.% has account_type value(s) this schema cannot accept: %. '
+          'Allowed values are ''spot'' and ''perp''. Fix or remove those rows, '
+          'then run this file again. Nothing has been changed.', t, bad;
+      end if;
+    end if;
+
+    -- exchange: everything older than multi-venue support is Coinbase
+    if exists (select 1 from information_schema.columns
+                where table_schema = 'public' and table_name = t
+                  and column_name = 'exchange') then
+      execute format(
+        'update public.%I set exchange = ''coinbase'' where exchange is null', t);
+
+      execute format(
+        'select string_agg(distinct exchange, '', '')
+           from public.%I where exchange not in (''coinbase'', ''lighter'')', t)
+        into bad;
+
+      if bad is not null then
+        raise exception
+          'public.% has exchange value(s) with no adapter in venues.py: %. '
+          'Either add the adapter and list it here, or fix those rows. '
+          'Nothing has been changed.', t, bad;
+      end if;
+    end if;
+  end loop;
+end $$;
 
 
 -- ---------------------------------------------------------------------------
@@ -66,6 +163,66 @@ create table if not exists public.participant_api_keys (
     check (account_type in ('spot', 'perp'))
 );
 
+-- Bring an existing table up to spec. Everything below is a no-op on a fresh
+-- database and the actual repair on an older one.
+--
+-- This block was missing, and its absence made the whole file fail on any
+-- database created before multi-venue support: the inline column list above
+-- only runs when the table does NOT already exist, so `exchange` was never
+-- added to participant_api_keys the way it is to the other three tables - and
+-- the check constraint further down then referenced a column that wasn't
+-- there. Nothing caught it because a database created fresh from this file
+-- already has the column.
+alter table public.participant_api_keys add column if not exists exchange text;
+update public.participant_api_keys set exchange = 'coinbase' where exchange is null;
+alter table public.participant_api_keys alter column exchange set not null;
+
+-- What the venue said this key can do, captured when it was proven read-only
+-- at signup. Coinbase answers this via GET /api/v3/brokerage/key_permissions
+-- ({can_view, can_trade, can_transfer, portfolio_uuid, portfolio_type});
+-- Lighter has no equivalent because the read-only token format is itself the
+-- guarantee, so its rows stay null.
+--
+-- Stored rather than re-derived because permissions CAN WIDEN after signup -
+-- a participant can edit a key's scope on the exchange at any time, and
+-- nothing notifies us. Keeping the last answer and its timestamp makes
+-- re-checking a scheduled job over stale rows (~200 requests a day) instead
+-- of a check on every sync (~4,800).
+alter table public.participant_api_keys
+  add column if not exists permissions jsonb;
+alter table public.participant_api_keys
+  add column if not exists permissions_checked_at timestamptz;
+
+-- Same for the venue key. sign_ups.register_credential() upserts with
+-- on_conflict=(participant_id, exchange, account_type), which needs a real
+-- unique constraint to target - without it every registration fails with
+-- "42P10: no unique or exclusion constraint matching the ON CONFLICT
+-- specification".
+--
+-- Duplicates first, or the constraint refuses to build. Keeps the newest row
+-- per venue: unlike the history tables, where the earliest row is the
+-- original, a repeated credential row means the participant re-registered
+-- and the LAST key they gave is the one that still works.
+delete from public.participant_api_keys a
+ using public.participant_api_keys b
+ where a.id < b.id
+   and a.participant_id = b.participant_id
+   and a.exchange       = b.exchange
+   and a.account_type   = b.account_type;
+
+do $$
+begin
+  if not exists (
+    select 1 from pg_constraint
+     where conname = 'participant_api_keys_venue_key'
+  ) then
+    alter table public.participant_api_keys
+      add constraint participant_api_keys_venue_key
+      unique (participant_id, exchange, account_type);
+  end if;
+end $$;
+
+
 -- account_type is restricted to what the code actually HANDLES, not to every
 -- venue Coinbase can name. get_account_totals_usdc() dispatches perp vs. spot
 -- and nothing else; latest_balances sums only those two, so a 'future' row
@@ -96,6 +253,25 @@ alter table public.participant_api_keys
 -- holds, and the placeholder would eventually be handed to an exchange.
 alter table public.participant_api_keys
   alter column api_secret drop not null;
+
+-- `exchange` must name a venue the code actually has an adapter for -
+-- venues.VENUES is the source of truth and this is the database agreeing
+-- with it.
+--
+-- Without this, a typo at registration ('coinbse') inserts happily and then
+-- fails EVERY sync with UnknownVenue, leaving that participant silently off
+-- the leaderboard for as long as nobody reads fetch_errors. Worse on a
+-- cross-exchange strategy: with one venue missing, the other leg reads as an
+-- unhedged directional bet rather than half of a hedge.
+--
+-- The cost is that adding a third venue needs a line here as well as in
+-- venues.py. tests/test_venues.py asserts the two lists match, so they can't
+-- drift apart in silence.
+alter table public.participant_api_keys
+  drop constraint if exists participant_api_keys_exchange_check;
+alter table public.participant_api_keys
+  add constraint participant_api_keys_exchange_check
+  check (exchange in ('coinbase', 'lighter'));
 
 
 -- ---------------------------------------------------------------------------
@@ -158,6 +334,17 @@ alter table public.trade_metrics alter column exchange set not null;
 alter table public.trade_metrics
   drop constraint if exists trade_metrics_participant_account_order_key;
 
+-- Duplicates must go first, or the constraint refuses to build and takes the
+-- whole file down with it. Keeps the lowest id of each group, matching what
+-- balance_snapshots does below.
+delete from public.trade_metrics a
+ using public.trade_metrics b
+ where a.id > b.id
+   and a.participant_id = b.participant_id
+   and a.exchange       = b.exchange
+   and a.account_type   = b.account_type
+   and a.order_id       = b.order_id;
+
 do $$
 begin
   if not exists (
@@ -180,6 +367,13 @@ alter table public.trade_metrics
 alter table public.trade_metrics
   add constraint trade_metrics_account_type_check
   check (account_type in ('spot', 'perp'));
+
+-- Same vocabulary as participant_api_keys.exchange - see the note there.
+alter table public.trade_metrics
+  drop constraint if exists trade_metrics_exchange_check;
+alter table public.trade_metrics
+  add constraint trade_metrics_exchange_check
+  check (exchange in ('coinbase', 'lighter'));
 
 
 -- ---------------------------------------------------------------------------
@@ -248,6 +442,16 @@ alter table public.balance_snapshots
 alter table public.balance_snapshots
   add constraint balance_snapshots_account_type_check
   check (account_type in ('spot', 'perp'));
+
+-- Matters most here, for the same reason the account_type check does:
+-- latest_balances sums per (exchange, account_type), so a snapshot written
+-- under an unrecognised venue would still be summed into the leaderboard
+-- while being invisible to every other query that knows the venue list.
+alter table public.balance_snapshots
+  drop constraint if exists balance_snapshots_exchange_check;
+alter table public.balance_snapshots
+  add constraint balance_snapshots_exchange_check
+  check (exchange in ('coinbase', 'lighter'));
 
 
 -- ---------------------------------------------------------------------------
@@ -323,6 +527,15 @@ alter table public.cash_flows alter column exchange set not null;
 alter table public.cash_flows
   drop constraint if exists cash_flows_participant_account_transfer_key;
 
+-- Same reason as trade_metrics and balance_snapshots.
+delete from public.cash_flows a
+ using public.cash_flows b
+ where a.id > b.id
+   and a.participant_id = b.participant_id
+   and a.exchange       = b.exchange
+   and a.account_type   = b.account_type
+   and a.transfer_id    = b.transfer_id;
+
 do $$
 begin
   if not exists (
@@ -345,12 +558,123 @@ alter table public.cash_flows
   add constraint cash_flows_account_type_check
   check (account_type in ('spot', 'perp'));
 
+-- Same vocabulary again. metrics.mark_internal_transfers() pairs a
+-- participant's flows by (exchange, account_type) to net out money moved
+-- between their own venues - central to cross-exchange arbitrage, where
+-- collateral shuttles constantly. An unrecognised venue label would leave
+-- those transfers unpaired and counted as real external funding.
+alter table public.cash_flows
+  drop constraint if exists cash_flows_exchange_check;
+alter table public.cash_flows
+  add constraint cash_flows_exchange_check
+  check (exchange in ('coinbase', 'lighter'));
+
 
 -- ---------------------------------------------------------------------------
--- 7. Indexes
+-- 7. Participant scores — what the leaderboard actually ranks on
 --
--- get_last_synced_timestamp() runs once per participant per credential per
--- run — 200 lookups every 15 minutes at 100 participants.
+-- Written by score.py after every sync. This is the table that makes the
+-- competition a competition: without it the only ranking available is
+-- latest_balances.total_usdc, which ranks DEPOSITS. On live data the two
+-- orderings came out exactly inverted - the participant with 2,000x more
+-- money in the account had the worse risk-adjusted return.
+--
+-- One CURRENT row per (participant, period), upserted. Deliberately not a
+-- history table: the score is recomputed from complete stored history on
+-- every run, so a time series is derivable from balance_snapshots whenever
+-- it is wanted, and storing 200 rows an hour that nothing reads is exactly
+-- what the dropped is_internal column (section 6) argues against.
+--
+-- sharpe is NULLABLE and that is load-bearing. Three different situations
+-- produce no number, and all three must still produce a ROW:
+--
+--   too little history   a new participant, or one whose credential broke
+--                        before three snapshots existed
+--   no volatility        a flat account - the guard in sharpe_from_returns
+--   registration bug     a participants row whose credential write failed,
+--                        which is invisible everywhere else in the system
+--
+-- A participant who is absent from this table is a participant nobody can
+-- see is missing. unreliable_reason carries the explanation so the answer is
+-- readable rather than just blank.
+-- ---------------------------------------------------------------------------
+
+create table if not exists public.participant_scores (
+  participant_id     uuid not null references public.participants(id) on delete cascade,
+  period             text not null,
+  computed_at        timestamptz not null default now(),
+
+  sharpe             numeric,          -- null when not computable; see above
+  unreliable_reason  text,
+
+  -- `reliable` is periods >= 20. For the first ~20 days of a 90-day
+  -- competition NOBODY qualifies, so this sorts the board rather than
+  -- filtering it - provisional entries rank below established ones instead
+  -- of vanishing, which would look identical to not having registered.
+  reliable           boolean not null default false,
+
+  periods            integer,          -- single-period returns that survived gaps
+  observed_periods   integer,
+  gap_periods        integer,
+  calendar_periods   integer,
+  mean_return        numeric,
+  volatility         numeric,
+
+  -- Kept because they are the audit trail for the adjustment. A participant
+  -- disputing their rank is really disputing one of these numbers.
+  --
+  -- The two venue figures are separate on purpose: they mean opposite things.
+  -- dropped_venue_usdc is money that left the competition when a credential
+  -- went silent for three days; joined_venue_usdc is a venue's opening
+  -- balance the first time it reported, booked as an inflow so that
+  -- registering a second exchange mid-competition does not read as profit.
+  -- Netting them would hide both, and the join is the larger correction in
+  -- practice - adding a venue is routine, losing one is not.
+  external_flow_usdc numeric,
+  dropped_venue_usdc numeric,
+  joined_venue_usdc  numeric,
+  internal_transfers integer,
+
+  first_period       text,
+  last_period        text,
+
+  primary key (participant_id, period)
+);
+
+-- The column list above only runs when the table does NOT already exist, so
+-- anything added to it later has to be repeated here or a database created
+-- from an earlier revision never acquires it. That exact omission is what
+-- made this file fail on any pre-multi-venue database once, when `exchange`
+-- was added to participant_api_keys and only declared inline.
+--
+-- A missing column here would not error, which is worse: score.py's upsert
+-- would be rejected by PostgREST for an unknown column and EVERY
+-- participant's score would silently stop updating.
+alter table public.participant_scores
+  add column if not exists joined_venue_usdc numeric;
+
+alter table public.participant_scores
+  drop constraint if exists participant_scores_period_check;
+alter table public.participant_scores
+  add constraint participant_scores_period_check
+  check (period in ('daily', 'hourly'));
+
+
+-- ---------------------------------------------------------------------------
+-- 8. Indexes
+--
+-- Two distinct access patterns, and an index that serves one will not serve
+-- the other:
+--
+--   the SYNC     asks "what is the newest row for this credential", filtered
+--                by venue, sorted descending, limit 1 — once per credential
+--                per run, so 400 lookups every 15 minutes at 200 credentials.
+--
+--   the METRICS  read a participant's ENTIRE history, every venue, oldest
+--                first, in pages. Unpaginated selects were silently capped by
+--                PostgREST at Supabase's max-rows, which — because the sort is
+--                oldest-first — kept the OLDEST rows and quietly froze every
+--                participant's score in a window that stopped advancing.
 -- ---------------------------------------------------------------------------
 
 -- Column order matches the resume-point lookups exactly: they filter on
@@ -363,15 +687,56 @@ drop index if exists balance_snapshots_participant_time_idx;
 create index if not exists balance_snapshots_participant_venue_time_idx
   on public.balance_snapshots (participant_id, exchange, account_type, timestamp desc);
 
-create index if not exists participant_api_keys_participant_idx
-  on public.participant_api_keys (participant_id) where is_active;
+-- The sync now reads every active credential in ONE request rather than one
+-- per participant, ordered so that the same credential collects a
+-- participant's account-wide transfers on every run. A partial index on the
+-- is_active predicate is what keeps that a small scan rather than a full one.
+drop index if exists participant_api_keys_participant_idx;
+create index if not exists participant_api_keys_active_idx
+  on public.participant_api_keys (exchange, account_type, id) where is_active;
 
-create index if not exists cash_flows_participant_time_idx
-  on public.cash_flows (participant_id, timestamp);
+-- Two different queries read cash_flows, and they want different orders.
+--
+-- 1. The resume point. For a venue whose transfer history covers the whole
+--    ACCOUNT — Coinbase — the lookup deliberately does NOT filter on
+--    account_type, because only one of a participant's credentials collects
+--    those transfers and which one that is can change. So the filter is
+--    (participant_id, exchange) and the answer is the newest timestamp.
+create index if not exists cash_flows_participant_venue_time_idx
+  on public.cash_flows (participant_id, exchange, timestamp desc);
+
+-- 2. metrics.fetch_cash_flows() reads a participant's whole history oldest
+--    first, paged. id is in the key because the sort is (timestamp, id):
+--    two transfers in the same millisecond have no defined order otherwise,
+--    and rows can shift between pages under an ambiguous sort — dropping one
+--    and repeating another.
+drop index if exists cash_flows_participant_time_idx;
+create index if not exists cash_flows_participant_time_id_idx
+  on public.cash_flows (participant_id, timestamp, id);
+
+-- metrics.fetch_snapshots() has the same shape and the same reason. The
+-- venue-keyed index above serves the resume-point lookup, which sorts
+-- DESCENDING within a single venue; this one serves the metrics read, which
+-- sorts ascending across all of them. Neither substitutes for the other.
+--
+-- This is the one that grows: the sync writes a snapshot per credential per
+-- run, so at 200 credentials on a 15-minute cron it is ~19,000 rows a day.
+create index if not exists balance_snapshots_participant_time_id_idx
+  on public.balance_snapshots (participant_id, timestamp, id);
 
 
 -- ---------------------------------------------------------------------------
--- 8. Leaderboard view
+-- 9. Leaderboard views
+--
+-- TWO views, and the distinction matters:
+--
+--   latest_balances  current equity per participant, by venue. Correct at
+--                    what it does, and it was only ever MISLABELLED as the
+--                    leaderboard - ranking on it ranks whoever deposited
+--                    most. Kept as a display column.
+--
+--   leaderboard      the actual ranking, on flow-adjusted Sharpe from
+--                    participant_scores.
 --
 -- Spot and perps are ONE competition, so total_usdc sums both venues while
 -- keeping each visible separately.
@@ -409,8 +774,52 @@ left join (
 group by p.id, p.display_name;
 
 
+-- The competition ranking.
+--
+-- rank() is materialised as a COLUMN rather than left to an ORDER BY on the
+-- view, because an ORDER BY inside a view is not guaranteed to survive an
+-- outer query - a client doing `select * from leaderboard limit 10` could
+-- silently get ten arbitrary rows. As a column the rank cannot be lost.
+--
+-- Sorted by `reliable` first so that early in the competition, when nobody
+-- has the 20 daily returns that make a Sharpe meaningful, provisional
+-- entries still appear - below the established ones, not instead of them.
+--
+-- nulls last on both keys keeps participants with no computable score at the
+-- bottom rather than at the top, which is where NULL sorts by default in
+-- descending order.
+create or replace view public.leaderboard as
+select
+  p.id                                     as participant_id,
+  p.display_name,
+  s.sharpe,
+  s.reliable,
+  s.unreliable_reason,
+  s.periods,
+  s.gap_periods,
+  -- The three numbers that were subtracted from this participant's return.
+  -- All three or none: a disputed rank is really a dispute about one of
+  -- them, and showing external_flow_usdc while hiding the venue adjustments
+  -- would make that argument impossible to settle from the leaderboard.
+  s.external_flow_usdc,
+  s.joined_venue_usdc,
+  s.dropped_venue_usdc,
+  s.computed_at,
+  b.spot_usdc,
+  b.perp_usdc,
+  b.total_usdc,
+  b.as_of,
+  rank() over (order by s.reliable desc nulls last,
+                        s.sharpe   desc nulls last)  as rank
+from public.participants p
+left join public.participant_scores s
+       on s.participant_id = p.id and s.period = 'daily'
+left join public.latest_balances b
+       on b.participant_id = p.id;
+
+
 -- ---------------------------------------------------------------------------
--- 9. Row Level Security
+-- 10. Row Level Security
 --
 -- The sync uses the SERVICE ROLE key, which bypasses RLS entirely. These
 -- policies only constrain what the anon key can reach.
@@ -426,6 +835,7 @@ alter table public.trade_metrics        enable row level security;
 alter table public.balance_snapshots    enable row level security;
 alter table public.fetch_errors         enable row level security;
 alter table public.cash_flows           enable row level security;
+alter table public.participant_scores   enable row level security;
 
 drop policy if exists "participants read own trades"    on public.trade_metrics;
 drop policy if exists "participants read own snapshots" on public.balance_snapshots;
@@ -445,7 +855,7 @@ create policy "leaderboard is readable"
 
 
 -- ---------------------------------------------------------------------------
--- 10. View access
+-- 11. View access
 --
 -- IMPORTANT: views do NOT inherit RLS. By default a view runs with its
 -- owner's privileges, so latest_balances bypasses every policy above — which
@@ -457,3 +867,40 @@ create policy "leaderboard is readable"
 
 revoke all on public.latest_balances from anon;
 grant select on public.latest_balances to authenticated;
+
+-- The leaderboard carries no email, no key material and no per-trade detail -
+-- only display_name and a score - so it is the one view that could safely be
+-- made public. Granted to `authenticated` by default; add `anon` to turn it
+-- into a public JSON endpoint over PostgREST with no frontend at all.
+revoke all on public.leaderboard from anon;
+grant select on public.leaderboard to authenticated;
+
+
+-- ---------------------------------------------------------------------------
+-- 12. Confirmation
+--
+-- The SQL editor shows the result of the LAST statement, so this is what you
+-- see after pressing Run. Without it a successful migration looks identical
+-- to one that silently did nothing.
+-- ---------------------------------------------------------------------------
+
+commit;
+
+select
+  (select count(*) from information_schema.tables
+    where table_schema = 'public'
+      and table_name in ('participants', 'participant_api_keys',
+                         'trade_metrics', 'balance_snapshots',
+                         'fetch_errors', 'cash_flows'))          as tables,
+  (select count(*) from pg_indexes
+    where schemaname = 'public')                                 as indexes,
+  (select count(*) from pg_constraint c
+     join pg_class t on t.oid = c.conrelid
+    where c.contype = 'c'
+      and c.conname like '%\_check')                            as check_constraints,
+  (select count(*) from information_schema.views
+    where table_schema = 'public' and table_name = 'latest_balances')
+                                                                 as leaderboard_view,
+  (select count(*) from public.participants)                     as participants,
+  (select count(*) from public.participant_api_keys where is_active)
+                                                                 as active_credentials;

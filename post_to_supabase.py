@@ -715,6 +715,27 @@ if __name__ == "__main__":
 
     summary = sync_all_to_supabase()
 
+    # Rank everyone on what was just recorded.
+    #
+    # In this process rather than a second service, because scoring has to run
+    # AFTER the sync to include the newest snapshot - here that is one line;
+    # across two Railway services it is a schedule someone has to keep correct
+    # forever.
+    #
+    # Imported here, not at module scope, so the sync does not depend on the
+    # scorer being importable. A syntax error in score.py must not stop data
+    # being collected, since a snapshot missed at 12:15 is gone for good while
+    # a score can be recomputed from stored history at any time.
+    try:
+        import score
+        score.write_all_scores()
+    except Exception as e:
+        # Deliberately does NOT touch `code`. Scoring is derived data - it
+        # recomputes from complete history next run, so a failure here is
+        # stale ranks, not lost data, and failing the run for it would make
+        # the exit code stop meaning "the sync is broken".
+        logger.error("Scoring failed - leaderboard ranks are stale: %s", e)
+
     # Without a non-zero exit the process always reports success, so a sync
     # that has silently stopped working looks identical to a healthy one and
     # nothing the host offers (alerts, retries, run history) can tell them
