@@ -71,21 +71,37 @@ def _tracked_top_level_modules() -> set[str] | None:
     gitignored precisely because they are not part of the service. Globbing
     would demand they import, and they hold credentials and side effects.
     """
-    try:
-        out = subprocess.run(
-            ["git", "ls-files", "*.py"],
-            cwd=REPO_ROOT, capture_output=True, text=True, timeout=30,
-        )
-    except (OSError, subprocess.SubprocessError):
+    def git(*args) -> str | None:
+        try:
+            out = subprocess.run(["git", *args], cwd=REPO_ROOT,
+                                 capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return out.stdout if out.returncode == 0 else None
+
+    # Which repository is git actually answering about? A `git init` left in
+    # a parent directory - a home directory, most easily - makes every git
+    # command run from a non-repo resolve upwards and SUCCEED, returning that
+    # repository's file list instead of this one's.
+    #
+    # An empty list from the wrong repository is the dangerous shape: the
+    # coverage test below compares tracked-minus-required and would pass
+    # vacuously, reporting green while checking nothing. Confirming the root
+    # is the only way to tell "no modules tracked" from "wrong repository".
+    top = git("rev-parse", "--show-toplevel")
+    if top is None or Path(top.strip()).resolve() != REPO_ROOT.resolve():
         return None
 
-    if out.returncode != 0:
+    listing = git("ls-files", "*.py")
+    if listing is None:
         return None
 
+    # Top level only: `tests/conftest.py` is tracked but is not a module the
+    # service imports.
     return {
         Path(line).stem
-        for line in out.stdout.splitlines()
-        if line.strip() and "/" not in line.strip()
+        for line in (raw.strip() for raw in listing.splitlines())
+        if line and "/" not in line
     }
 
 

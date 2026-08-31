@@ -427,6 +427,15 @@ def _env_vars_read_by_code() -> set[str]:
 
     root = Path(__file__).resolve().parent.parent
 
+    # Confirm git is answering about THIS repository. A stray `git init` in a
+    # parent directory makes git resolve upwards and succeed with that
+    # repository's file list - here an empty one, which would silently reduce
+    # both tests below to skips and check nothing at all.
+    top = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=root,
+                         capture_output=True, text=True, timeout=30)
+    if top.returncode != 0 or Path(top.stdout.strip()).resolve() != root.resolve():
+        return set()
+
     out = subprocess.run(["git", "ls-files", "*.py"], cwd=root,
                          capture_output=True, text=True, timeout=30)
     if out.returncode != 0:
