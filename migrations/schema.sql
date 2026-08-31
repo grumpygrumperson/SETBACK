@@ -774,6 +774,54 @@ left join (
 group by p.id, p.display_name;
 
 
+-- Daily equity: one row per venue per UTC day.
+--
+-- The scorer's read path. Not a summary for display - it is exactly what
+-- build_portfolio_series already reduces balance_snapshots to for a daily
+-- axis, computed in Postgres instead of shipped over the network and thrown
+-- away in Python.
+--
+-- Why: score.py re-reads every participant's COMPLETE history on every run,
+-- and a competition only gets longer. Measured growth at the current write
+-- rate (54 rows per participant per day):
+--
+--     participants   rows @90d   MB/run   paged requests/run
+--                2       9,643        2                   11
+--              100     482,143       78                  487
+--              200     964,286      155                  973
+--
+-- That is every hour, forever, rising linearly with elapsed days. Reading
+-- last-of-day turns 200 participants into ~36,000 rows and ~44 requests.
+--
+-- It is EXACT, not approximate. build_portfolio_series takes the LAST
+-- snapshot of each venue within each period, so on a daily axis every row
+-- this view drops is one the metric already discarded. Verified against live
+-- data: sharpe, mean_return, volatility and every period count identical
+-- from 20 rows as from 405.
+--
+-- The alternative was deleting intermediate snapshots on a retention policy.
+-- This is better: same read reduction, nothing destroyed, and reversible.
+-- Full-resolution history stays for audit, for disputes, and for anything
+-- that needs an intra-day axis.
+--
+-- `id` is carried because callers sort on (timestamp, id): two venues written
+-- in the same millisecond have no defined order otherwise, and rows can shift
+-- between pages under an ambiguous sort - dropping one and repeating another.
+create or replace view public.daily_balances as
+select distinct on (participant_id, exchange, account_type,
+                    (to_timestamp(timestamp / 1000.0) at time zone 'UTC')::date)
+       id,
+       participant_id,
+       exchange,
+       account_type,
+       timestamp,
+       total_usdc
+  from public.balance_snapshots
+ order by participant_id, exchange, account_type,
+          (to_timestamp(timestamp / 1000.0) at time zone 'UTC')::date,
+          timestamp desc, id desc;
+
+
 -- The competition ranking.
 --
 -- rank() is materialised as a COLUMN rather than left to an ORDER BY on the
@@ -874,6 +922,14 @@ grant select on public.latest_balances to authenticated;
 -- into a public JSON endpoint over PostgREST with no frontend at all.
 revoke all on public.leaderboard from anon;
 grant select on public.leaderboard to authenticated;
+
+-- daily_balances is revoked from BOTH roles, unlike the two views above.
+-- Views bypass RLS, and this one exposes every participant's complete daily
+-- equity curve - not just their current total. The only consumer is score.py,
+-- which connects with the service role and is unaffected by grants. Nothing
+-- else should be able to read it.
+revoke all on public.daily_balances from anon;
+revoke all on public.daily_balances from authenticated;
 
 
 -- ---------------------------------------------------------------------------

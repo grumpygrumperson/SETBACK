@@ -446,3 +446,91 @@ def test_an_unpriceable_transfer_does_not_take_down_the_participant():
     ]
     marked = metrics.mark_internal_transfers(flows)
     assert [f["is_internal"] for f in marked] == [False, False]
+
+
+# ---------------------------------------------------------------------------
+# daily_balances is exact, not approximate
+#
+# The scorer reads the daily_balances view rather than every snapshot ever
+# written: at 200 participants over 90 days that is ~36,000 rows an hour
+# instead of ~964,000, and the gap widens for as long as the competition
+# runs.
+#
+# That substitution is only legitimate if it changes no number. It does not,
+# because build_portfolio_series already takes the LAST snapshot of each
+# venue within each period - so on a daily axis every row the view omits is
+# one the metric discarded anyway. These tests hold that property still, in
+# SQL and in Python, since the two now have to agree.
+#
+# The equivalent claim for an hourly axis is FALSE, which is why
+# score.PERIODS is daily-only and fetch_snapshots_for makes the caller ask.
+# ---------------------------------------------------------------------------
+
+def _last_of_day(rows: list[dict]) -> list[dict]:
+    """What the daily_balances view returns, computed in Python."""
+    keep: dict = {}
+    for row in sorted(rows, key=lambda r: r["timestamp"]):
+        day = metrics._period_key(row["timestamp"], "daily")
+        keep[(row.get("exchange"), row["account_type"], day)] = row
+    return sorted(keep.values(), key=lambda r: r["timestamp"])
+
+
+def _busy_week() -> list[dict]:
+    """Two venues, several snapshots a day, a gap day, and a venue joining."""
+    rows = []
+    for day, base in enumerate([100, 104, 96, 111, 108, 121, 117], start=1):
+        for hour, drift in ((3, -3), (9, 1), (15, -2), (21, 0)):
+            rows.append(snapshot(day, base + drift, venue="spot", hour=hour))
+        if day >= 3:                      # perps join partway through
+            rows.append(snapshot(day, 40 + day, venue="perp", hour=20))
+    return rows
+
+
+def test_daily_downsampling_keeps_only_the_last_row_of_each_day():
+    thinned = _last_of_day(_busy_week())
+
+    # One row per venue per day it reported: 7 spot days + 5 perp days.
+    assert len(thinned) == 12
+
+    # And it is the LAST of the day that survives - hour 21 for spot.
+    spot_day_one = [r for r in thinned
+                    if r["account_type"] == "spot"
+                    and metrics._period_key(r["timestamp"], "daily") == "2026-01-01"]
+    assert len(spot_day_one) == 1
+    assert spot_day_one[0]["timestamp"] == ts(1, hour=21)
+
+
+def test_daily_series_is_identical_from_downsampled_rows():
+    """The property the view rests on, at the series level."""
+    full = _busy_week()
+
+    assert (metrics.build_portfolio_series(full, period="daily")
+            == metrics.build_portfolio_series(_last_of_day(full), period="daily"))
+
+
+def test_daily_sharpe_is_identical_from_downsampled_rows():
+    """And end to end, which is the number anyone actually disputes."""
+    full = _busy_week()
+    flows: list[dict] = []
+
+    from_full = metrics.participant_sharpe(
+        "p1", period="daily", snapshots=full, flows=flows)
+    from_thin = metrics.participant_sharpe(
+        "p1", period="daily", snapshots=_last_of_day(full), flows=flows)
+
+    assert from_full == from_thin
+    assert from_full["sharpe"] is not None       # a real score, not two Nones
+
+
+def test_hourly_series_is_NOT_preserved_by_downsampling():
+    """
+    The limit of the trick, asserted so nobody widens it by accident.
+
+    If this ever passes, either the fixture stopped having intra-day movement
+    or something is wrong - and the consequence would be an hourly score
+    silently computed from one snapshot a day.
+    """
+    full = _busy_week()
+
+    assert (metrics.build_portfolio_series(full, period="hourly")
+            != metrics.build_portfolio_series(_last_of_day(full), period="hourly"))

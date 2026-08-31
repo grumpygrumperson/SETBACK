@@ -263,14 +263,81 @@ def _fetch_grouped(table: str, columns: str, participant_ids: list[str],
     return grouped
 
 
+_SNAPSHOT_COLUMNS = "participant_id,exchange,account_type,timestamp,total_usdc"
+
+# Where snapshots can be read from, and what each costs.
+#
+#   full    balance_snapshots - every snapshot as written, one per venue per
+#           sync run. Required for any axis finer than a day.
+#
+#   daily   the daily_balances view - the LAST snapshot per venue per UTC
+#           day, which is precisely what build_portfolio_series reduces the
+#           full set to for a daily axis. Not an approximation: every row it
+#           omits is one the metric already discarded.
+#
+# The difference is not marginal. Scoring re-reads complete history every
+# run, so at 200 participants over 90 days "full" is ~964,000 rows and ~973
+# paged requests an hour, rising for as long as the competition lasts;
+# "daily" is ~36,000 rows and ~44 requests.
+_SNAPSHOT_SOURCES = {"full": "balance_snapshots", "daily": "daily_balances"}
+
+
 def fetch_snapshots_for(participant_ids: list[str],
-                        chunk: int = _PARTICIPANT_CHUNK) -> dict[str, list[dict]]:
-    """Snapshots for many participants at once, oldest first, grouped by id."""
-    return _fetch_grouped(
-        "balance_snapshots",
-        "participant_id,exchange,account_type,timestamp,total_usdc",
-        participant_ids, chunk,
-    )
+                        chunk: int = _PARTICIPANT_CHUNK,
+                        resolution: str = "full") -> dict[str, list[dict]]:
+    """
+    Snapshots for many participants at once, oldest first, grouped by id.
+
+    `resolution` defaults to "full" because that is always correct. Callers
+    that only build a daily axis should ask for "daily" explicitly - the
+    saving is large and the choice belongs at the call site, where whether an
+    intra-day axis is needed is actually known.
+    """
+    if resolution not in _SNAPSHOT_SOURCES:
+        raise ValueError(
+            f"resolution must be one of {sorted(_SNAPSHOT_SOURCES)}, "
+            f"got {resolution!r}"
+        )
+
+    table = _SNAPSHOT_SOURCES[resolution]
+
+    try:
+        return _fetch_grouped(table, _SNAPSHOT_COLUMNS, participant_ids, chunk)
+    except Exception as e:
+        # daily_balances is a view, and this schema is applied by hand in the
+        # Supabase SQL editor - so a deploy can legitimately be running code
+        # that is newer than the database. That has already happened once
+        # this project, and the failure mode was silent: scoring is wrapped in
+        # try/except by its caller, so a missing relation shows up as ranks
+        # that quietly stop updating.
+        #
+        # Falling back reads the same underlying rows, just more of them, so
+        # the score is identical - only slower. Loud enough to notice, cheap
+        # enough not to break the run.
+        if table == "balance_snapshots" or not _looks_like_missing_relation(e):
+            raise
+
+        logger.warning(
+            "%s is not available (%s) - falling back to balance_snapshots. "
+            "The score is unaffected but the read is ~20x larger. Re-run "
+            "migrations/schema.sql to create it.", table, e
+        )
+        return _fetch_grouped("balance_snapshots", _SNAPSHOT_COLUMNS,
+                              participant_ids, chunk)
+
+
+def _looks_like_missing_relation(error: Exception) -> bool:
+    """
+    Whether this error means "that relation isn't there", rather than
+    anything else.
+
+    PostgREST answers a missing table or view with PGRST205 and a message
+    naming the schema cache. Matched on both so an unrelated failure - a
+    timeout, a bad key - propagates instead of being silently downgraded into
+    a slower read.
+    """
+    text = str(error)
+    return "PGRST205" in text or "schema cache" in text
 
 
 def fetch_cash_flows_for(participant_ids: list[str],
