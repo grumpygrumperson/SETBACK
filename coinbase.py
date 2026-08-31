@@ -130,6 +130,84 @@ def build_exchange(api_key: str, api_secret: str, exchange_id: str = 'coinbase',
     return exchange
 
 
+def read_key_permissions(exchange: ccxt.Exchange) -> dict:
+    """
+    What this API key is actually allowed to do.
+
+    GET /api/v3/brokerage/key_permissions, which ccxt already binds. Verified
+    live against a real CDP key; the response is a flat dict, NOT nested under
+    a 'results' envelope:
+
+        {'can_view': True, 'can_trade': False, 'can_transfer': False,
+         'portfolio_uuid': '019ffaf3-...', 'portfolio_type': 'INTX'}
+
+    Two things fall out of that shape, and the second is why this replaces a
+    call rather than adding one:
+
+      - it is the auth check. An unauthorised key cannot read it.
+      - it returns portfolio_uuid AND portfolio_type, which is exactly what
+        find_perp_portfolio_uuid() costs a separate fetch_portfolios() call to
+        discover.
+    """
+    response = exchange.v3PrivateGetBrokerageKeyPermissions()
+
+    # Defensive: ccxt returns implicit-endpoint JSON verbatim, and Coinbase
+    # has been known to wrap payloads. Observed flat, handled either way.
+    if isinstance(response, dict) and 'results' in response:
+        response = response['results'] or {}
+
+    return response or {}
+
+
+def assert_read_only(permissions: dict, label: str = 'this key') -> None:
+    """
+    Refuse a credential that can do more than read.
+
+    The competition needs exactly one capability - reading balances - and
+    every capability beyond that is a liability held on the participant's
+    behalf:
+
+      can_transfer  the key can WITHDRAW. This is custody: a compromise of
+                    this service, or of the operator's laptop, drains
+                    participants' accounts.
+      can_trade     the key can place orders. Even never used, holding it
+                    means the competition COULD trade on a participant's
+                    account, which is exactly the accusation you cannot
+                    disprove after a disputed result.
+
+    An error is NEVER treated as a pass. A legacy HMAC key may 401 here where
+    a CDP key succeeds, and "the check failed so we let it through" is how a
+    control like this becomes decorative. COINBASE_PERMISSIONS_OPTIONAL exists
+    for that migration case and should stay unset.
+    """
+    if not permissions:
+        raise ValueError(
+            f"Could not read the permissions of {label}, so it cannot be "
+            f"confirmed read-only. Set COINBASE_PERMISSIONS_OPTIONAL=1 only "
+            f"if you accept registering keys whose scope is unknown."
+        )
+
+    if permissions.get('can_transfer'):
+        raise ValueError(
+            "This Coinbase key can WITHDRAW funds. The competition only reads "
+            "balances and will not hold a key that can move money. Create a "
+            "new key with View permission only."
+        )
+
+    if permissions.get('can_trade'):
+        raise ValueError(
+            "This Coinbase key can TRADE. The competition only reads balances "
+            "and will not hold a key that can place orders on your account. "
+            "Create a new key with View permission only."
+        )
+
+    if not permissions.get('can_view'):
+        raise ValueError(
+            "This Coinbase key cannot read your account, so there is nothing "
+            "to record. Create a key with View permission."
+        )
+
+
 def verify_credential(row: dict) -> dict:
     """
     Prove a Coinbase credential works, at signup, and resolve its account
@@ -137,12 +215,12 @@ def verify_credential(row: dict) -> dict:
 
     `row` is a signup record with api_key, api_secret, account_type and an
     optional api_passphrase; returns {'account_type', 'portfolio_uuid',
-    'passphrase'} for storage.
+    'passphrase', 'permissions'} for storage.
 
-    A perp credential additionally resolves its INTX portfolio UUID. That
-    costs one API call, paid once here rather than on every sync - and it
-    doubles as the auth check, since an unauthorised key can't list
-    portfolios.
+    One call to key_permissions does three jobs: it authenticates, it proves
+    the key is read-only, and it hands back the INTX portfolio UUID that
+    find_perp_portfolio_uuid() used to cost a separate request for. So adding
+    the security check made registration cheaper, not more expensive.
     """
     account_type = (str(row.get('account_type') or 'spot')).strip().lower()
     passphrase = row.get('api_passphrase') or None
@@ -157,20 +235,44 @@ def verify_credential(row: dict) -> dict:
         passphrase=passphrase,
     )
 
+    optional = os.getenv("COINBASE_PERMISSIONS_OPTIONAL", "").strip().lower() \
+        in ("1", "true", "yes")
+
+    try:
+        permissions = read_key_permissions(exchange)
+    except Exception as e:
+        if not optional:
+            # Not a pass. Name the participant's problem and stop.
+            raise ValueError(
+                f"Could not read this Coinbase key's permissions, so it "
+                f"cannot be confirmed read-only: {e}"
+            ) from e
+        logger.warning("COINBASE_PERMISSIONS_OPTIONAL is set - registering a "
+                       "key whose permissions could not be read: %s", e)
+        permissions = {}
+
+    if not optional:
+        assert_read_only(permissions, f"the {account_type} key")
+
     portfolio_uuid = None
     if account_type == 'perp':
-        portfolio_uuid = find_perp_portfolio_uuid(exchange)
+        # The permissions response already names the portfolio this key is
+        # scoped to. Only fall back to a lookup when it didn't.
+        if (permissions.get('portfolio_type') or '').upper() == 'INTX':
+            portfolio_uuid = permissions.get('portfolio_uuid')
+        if not portfolio_uuid:
+            portfolio_uuid = find_perp_portfolio_uuid(exchange)
         if not portfolio_uuid:
             raise ValueError(
                 "No perp portfolio visible to these credentials - the key may "
                 "be scoped to the spot portfolio instead"
             )
-    else:
-        # Cheap auth check, no exchange-specific params.
+    elif not permissions:
+        # Only needed when permissions couldn't authenticate for us.
         exchange.fetch_balance()
 
     return {'account_type': account_type, 'portfolio_uuid': portfolio_uuid,
-            'passphrase': passphrase}
+            'passphrase': passphrase, 'permissions': permissions}
 
 
 def build_from_credential(credential: dict) -> ccxt.Exchange:
