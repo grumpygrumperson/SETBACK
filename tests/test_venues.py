@@ -401,3 +401,98 @@ def test_concurrent_credentials_take_one_price_snapshot():
 
     assert sum(ex.ticker_calls for ex in exchanges) == 1
     assert all(s is seen[0] for s in seen)
+
+
+# ---------------------------------------------------------------------------
+# The documentation agrees with the code
+#
+# Same principle as the schema check above: an artifact that is not Python
+# cannot be kept correct by review alone. .env.example is the only inventory
+# of what the service needs to run, and five of the variables live inside
+# ENV_CREDENTIALS dicts rather than in os.getenv() calls, so they are
+# invisible to anyone grepping for the obvious pattern.
+#
+# Drift here is not cosmetic. An undocumented variable is one an operator
+# does not set on Railway, and the failure modes are silent: no
+# COMPETITION_END means the leaderboard keeps moving after the competition
+# closes.
+# ---------------------------------------------------------------------------
+
+def _env_vars_read_by_code() -> set[str]:
+    """Every environment variable name the service reads."""
+    import ast
+    import re
+    import subprocess
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+
+    out = subprocess.run(["git", "ls-files", "*.py"], cwd=root,
+                         capture_output=True, text=True, timeout=30)
+    if out.returncode != 0:
+        return set()
+
+    names: set[str] = set()
+    for rel in out.stdout.split():
+        if rel.startswith("tests/"):
+            continue
+        source = (root / rel).read_text(encoding="utf-8")
+
+        names |= set(re.findall(r'os\.getenv\(\s*"([A-Z][A-Z0-9_]*)"', source))
+        names |= set(re.findall(
+            r'os\.environ(?:\.get)?\(?\[?\s*"([A-Z][A-Z0-9_]*)"', source))
+
+        # ENV_CREDENTIALS maps an account_type to the NAME of the variable
+        # holding that venue's credential, so the name is a dict value and
+        # never appears next to os.getenv.
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.Assign) and any(
+                    getattr(t, "id", "") == "ENV_CREDENTIALS"
+                    for t in node.targets):
+                for leaf in ast.walk(node.value):
+                    if (isinstance(leaf, ast.Constant)
+                            and isinstance(leaf.value, str)
+                            and re.fullmatch(r"[A-Z][A-Z0-9_]*", leaf.value)):
+                        names.add(leaf.value)
+
+    return names
+
+
+def _env_vars_documented() -> set[str]:
+    """Every variable named in .env.example, commented-out ones included."""
+    import re
+    from pathlib import Path
+
+    text = (Path(__file__).resolve().parent.parent
+            / ".env.example").read_text(encoding="utf-8")
+    return set(re.findall(r'^#?\s*([A-Z][A-Z0-9_]*)=', text, re.M))
+
+
+def test_every_env_var_is_documented():
+    """A variable the code reads but nobody knows to set."""
+    read = _env_vars_read_by_code()
+    if not read:
+        import pytest
+        pytest.skip("git unavailable - cannot enumerate the tracked sources")
+
+    undocumented = read - _env_vars_documented()
+    assert not undocumented, (
+        f"read by the code but absent from .env.example: "
+        f"{sorted(undocumented)}"
+    )
+
+
+def test_no_documented_env_var_is_dead():
+    """
+    The mirror. A documented variable nothing reads is worse than useless:
+    an operator sets it, believes it took effect, and it never did.
+    """
+    read = _env_vars_read_by_code()
+    if not read:
+        import pytest
+        pytest.skip("git unavailable - cannot enumerate the tracked sources")
+
+    dead = _env_vars_documented() - read
+    assert not dead, (
+        f"documented in .env.example but read by nothing: {sorted(dead)}"
+    )
