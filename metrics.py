@@ -15,6 +15,11 @@ from statistics import mean, stdev
 from dotenv import load_dotenv
 from supabase import create_client
 
+# The competition window lives with the other competition-wide constants, not
+# here - every venue adapter reads the same two dates, and a second definition
+# would let the scoring window drift from the fetching one.
+import venue_common
+
 load_dotenv()
 
 logger = logging.getLogger(__name__)
@@ -43,6 +48,62 @@ _require_env("SUPABASE_URL", "SUPABASE_KEY")
 
 supabase = create_client(os.getenv("SUPABASE_URL"),
                          os.getenv("SUPABASE_KEY"))
+
+
+def _window_ms() -> tuple[int, int | None]:
+    """
+    The competition window in exchange milliseconds, as (start, end).
+
+    Read at CALL time rather than captured at import, so a test or a backfill
+    can change the window without reimporting the module - and so the two
+    dates are always read from the same place venue_common defines them.
+    """
+    from datetime import datetime as _dt
+
+    def parse(value):
+        if not value:
+            return None
+        text = value.strip().replace("Z", "+00:00")
+        return int(_dt.fromisoformat(text).timestamp() * 1000)
+
+    return parse(venue_common.COMPETITION_START), parse(venue_common.COMPETITION_END)
+
+
+def clip_to_competition(rows: list[dict]) -> list[dict]:
+    """
+    Drop anything outside the competition window.
+
+    Scoring is bounded at BOTH ends; fetching is not. The sync keeps
+    recording after the close because that is a useful audit trail, but a
+    leaderboard that keeps moving afterwards has no final result - day 57's
+    market movement would silently rewrite the standings of a contest that
+    already finished, and every rank would drift for as long as the cron
+    runs.
+
+    Bounded below for the mirror reason: a participant who was trading long
+    before the competition opened must not carry that history into their
+    score. Their first in-window snapshot is their starting line.
+
+    An unset COMPETITION_END means open-ended - correct for development,
+    wrong for a competition with a prize. See venue_common.
+    """
+    start, end = _window_ms()
+    if start is None and end is None:
+        return rows
+
+    kept = []
+    for row in rows:
+        ts = row.get("timestamp")
+        if ts is None:
+            continue
+        if start is not None and ts < start:
+            continue
+        if end is not None and ts > end:
+            continue
+        kept.append(row)
+
+    return kept
+
 
 # Crypto trades continuously, so a year is 365 days rather than 252 sessions.
 PERIODS_PER_YEAR = {
@@ -163,6 +224,66 @@ def fetch_cash_flows(participant_id: str) -> list[dict]:
     )
 
 
+# How many participants to ask about in one request. Chunked rather than
+# fetching the whole table at once for two reasons:
+#
+#   - .range() offsets stay shallow. A deep range(400000, 400999) makes
+#     Postgres walk and discard 400,000 rows to serve the last page, so an
+#     unchunked scan gets quadratically slower as the competition runs.
+#   - peak memory stays bounded by the chunk, not by the table.
+_PARTICIPANT_CHUNK = 25
+
+
+def _fetch_grouped(table: str, columns: str, participant_ids: list[str],
+                   chunk: int = _PARTICIPANT_CHUNK) -> dict[str, list[dict]]:
+    """
+    One table's rows for many participants, grouped by participant_id.
+
+    Scoring 200 participants one at a time is 400 paged scans before any
+    maths happens - the same N+1 the sync had. This turns it into ~8.
+
+    Every participant asked for gets a key, even when they have no rows.
+    The caller must be able to tell "no history" from "not looked at": the
+    first belongs on the leaderboard marked unreliable, the second is a bug.
+    """
+    grouped: dict[str, list[dict]] = {pid: [] for pid in participant_ids}
+
+    for i in range(0, len(participant_ids), chunk):
+        batch = participant_ids[i:i + chunk]
+        rows = _fetch_all(
+            lambda b=batch: (supabase.table(table)
+                             .select(columns)
+                             .in_("participant_id", b)
+                             .order("timestamp").order("id")),
+            f"{table} for {len(batch)} participant(s)",
+        )
+        for row in rows:
+            grouped.setdefault(row["participant_id"], []).append(row)
+
+    return grouped
+
+
+def fetch_snapshots_for(participant_ids: list[str],
+                        chunk: int = _PARTICIPANT_CHUNK) -> dict[str, list[dict]]:
+    """Snapshots for many participants at once, oldest first, grouped by id."""
+    return _fetch_grouped(
+        "balance_snapshots",
+        "participant_id,exchange,account_type,timestamp,total_usdc",
+        participant_ids, chunk,
+    )
+
+
+def fetch_cash_flows_for(participant_ids: list[str],
+                         chunk: int = _PARTICIPANT_CHUNK) -> dict[str, list[dict]]:
+    """Transfers for many participants at once, oldest first, grouped by id."""
+    return _fetch_grouped(
+        "cash_flows",
+        "participant_id,exchange,account_type,timestamp,usdc_value,"
+        "direction,currency,amount",
+        participant_ids, chunk,
+    )
+
+
 def _venue_of(row: dict) -> tuple[str, str]:
     """
     The venue a stored row came from: (exchange, account_type).
@@ -231,20 +352,67 @@ def mark_internal_transfers(flows: list[dict], window_ms: int = 3_600_000,
     return flows
 
 
-def flows_by_period(flows: list[dict], period: str = "daily") -> dict[str, float]:
+def venue_first_seen(snapshots: list[dict], period: str = "daily") -> dict:
+    """
+    The period label in which each venue first reported.
+
+    Needed because a transfer can be recorded BEFORE the venue it funded ever
+    appears in the equity curve - the money leaves Coinbase on Monday, the
+    Lighter credential is registered on Wednesday. Counting that deposit on
+    Monday subtracts it from a portfolio that does not contain the venue yet,
+    which reads as a large loss on a day nothing happened. One live
+    participant had a +15 USDC deposit recorded two days before their Lighter
+    balance first appeared.
+    """
+    first: dict = {}
+    for snap in snapshots:
+        if snap.get("total_usdc") is None:
+            continue
+        key = _period_key(snap["timestamp"], period)
+        venue = _venue_of(snap)
+        if venue not in first or key < first[venue]:
+            first[venue] = key
+    return first
+
+
+def flows_by_period(flows: list[dict], period: str = "daily",
+                    venue_since: dict = None) -> dict[str, float]:
     """
     Net EXTERNAL flow per period, signed (deposits positive).
 
     Internal transfers are excluded - they net to roughly zero anyway, but
     dropping them explicitly means a mismatched pair can't leak a spurious
     flow into someone's returns.
+
+    `venue_since` drops flows dated before their venue joined the portfolio.
+    Those are already accounted for: build_portfolio_series books a venue's
+    opening balance as an inflow on the period it appears, so counting the
+    funding transfer as well would subtract the same money twice - once on
+    the wrong day, against a portfolio that did not include the venue.
+
+    Period labels are zero-padded (%Y-%m-%d, %Y-%m-%dT%H), so comparing them
+    as strings is the same as comparing them as times.
     """
+    venue_since = venue_since or {}
     totals: dict[str, float] = {}
+
     for flow in flows:
         if flow.get("is_internal"):
             continue
+
         key = _period_key(flow["timestamp"], period)
+
+        joined = venue_since.get(_venue_of(flow))
+        if joined is not None and key < joined:
+            logger.debug(
+                "Ignoring %s flow dated %s - that venue first reported in %s, "
+                "and its opening balance already accounts for this money",
+                _venue_of(flow), key, joined
+            )
+            continue
+
         totals[key] = totals.get(key, 0.0) + float(flow["usdc_value"] or 0.0)
+
     return totals
 
 
@@ -378,6 +546,31 @@ def build_portfolio_series(snapshots: list[dict], period: str = "daily",
 
         if present:
             for venue, value in present.items():
+                # A venue APPEARING is a structural change, exactly like one
+                # disappearing below - and it was the asymmetry between the
+                # two that made this wrong. Summing a new venue in reads its
+                # opening balance as profit: one live participant's portfolio
+                # went 26.09 -> 39.04 the day their Lighter credential was
+                # registered, scored as +49.6%, on a day their Coinbase perp
+                # actually LOST money.
+                #
+                # Booking the opening value as an inflow is the conservative
+                # treatment. The value is some mix of transferred-in money and
+                # trading that happened before we could see the venue, and the
+                # two cannot be separated from outside - so measurement of
+                # that venue starts here rather than crediting it with a gain
+                # nobody observed.
+                #
+                # `venue not in carried` also catches a venue coming BACK
+                # after being dropped as stale: it was booked out as a
+                # withdrawal, so it has to be booked back in.
+                #
+                # index > 0 because no return ends at the first period, so an
+                # adjustment there would only misreport the opening portfolio
+                # as a flow.
+                if venue not in carried and index > 0:
+                    adjustments[key] = adjustments.get(key, 0.0) + value
+
                 carried[venue] = value
                 last_seen[venue] = index
 
@@ -508,7 +701,9 @@ def sharpe_ratio(values: list[float], risk_free_rate: float = 0.0,
 
 
 def participant_sharpe(participant_id: str, period: str = "daily",
-                       risk_free_rate: float = 0.0) -> dict:
+                       risk_free_rate: float = 0.0,
+                       snapshots: list[dict] = None,
+                       flows: list[dict] = None) -> dict:
     """
     Flow-adjusted Sharpe ratio for one participant, across all their venues.
 
@@ -523,12 +718,28 @@ def participant_sharpe(participant_id: str, period: str = "daily",
 
     A venue that stops reporting is dropped and treated as a withdrawal, on
     the same footing as an external transfer.
+
+    `snapshots` and `flows` can be supplied instead of fetched. The scorer
+    passes them, having read every participant's history in a handful of
+    batched queries rather than two per person - and it is what finally makes
+    this function testable, since until now the only way to reach the
+    assembly logic below was over the network.
     """
-    snapshots = fetch_snapshots(participant_id)
+    if snapshots is None:
+        snapshots = fetch_snapshots(participant_id)
+    if flows is None:
+        flows = fetch_cash_flows(participant_id)
+
+    # Bound BOTH ends before any maths. Everything below - the calendar axis,
+    # the venue join/drop bookkeeping, the flow netting - is derived from
+    # these two lists, so clipping here is the one place that has to be right.
+    snapshots = clip_to_competition(snapshots)
+    flows = clip_to_competition(flows)
+
     series, adjustments = build_portfolio_series(snapshots, period)
 
-    flows = mark_internal_transfers(fetch_cash_flows(participant_id))
-    external = flows_by_period(flows, period)
+    flows = mark_internal_transfers(flows)
+    external = flows_by_period(flows, period, venue_first_seen(snapshots, period))
 
     # Count periods that actually have data. len(series) is now the calendar
     # span, which a single snapshot on either side of a long outage would
@@ -554,7 +765,12 @@ def participant_sharpe(participant_id: str, period: str = "daily",
     result["first"], result["last"] = series[0][0], series[-1][0]
     result["external_flow_usdc"] = sum(external.values())
     result["internal_transfers"] = sum(1 for f in flows if f.get("is_internal"))
-    result["dropped_venue_usdc"] = sum(adjustments.values())
+    # Reported apart because they mean opposite things and netting them would
+    # hide both: a venue leaving is money out of the competition, a venue
+    # joining is money in. `adjustments` carries them signed and combined
+    # because the RETURN maths only cares about the net per period.
+    result["dropped_venue_usdc"] = sum(v for v in adjustments.values() if v < 0)
+    result["joined_venue_usdc"] = sum(v for v in adjustments.values() if v > 0)
 
     # Reported, not hidden: a participant scored on 8 of 30 days is a data
     # quality problem, and the number is the only way a reader can tell that
