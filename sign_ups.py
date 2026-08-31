@@ -1,6 +1,7 @@
 import csv
 import logging
 import os
+from datetime import datetime, timezone
 
 from supabase import create_client
 from dotenv import load_dotenv
@@ -121,6 +122,14 @@ def register_credential(participant_id, row, details: dict) -> None:
     """
     api_secret = _clean(row.get("api_secret"))
 
+    # What the venue said this key can do, recorded at the moment it was
+    # proven read-only. Stored so the answer can be re-checked on a schedule
+    # instead of re-derived on every sync - permissions CAN widen after
+    # signup, and 200 credentials re-checked daily is 200 requests rather than
+    # 4,800. Venues that expose nothing comparable (Lighter, where the token
+    # format is the guarantee) simply store null.
+    permissions = details.get("permissions") or None
+
     supabase.table("participant_api_keys").upsert(
         {
             "participant_id": participant_id,
@@ -133,6 +142,12 @@ def register_credential(participant_id, row, details: dict) -> None:
             "api_secret": encrypt_value(api_secret) if api_secret else None,
             "api_passphrase": encrypt_value(details["passphrase"]) if details["passphrase"] else None,
             "portfolio_uuid": details["portfolio_uuid"],
+            "permissions": permissions,
+            # A real timestamp, not the string "now()" - PostgREST sends JSON
+            # and Postgres will not evaluate a function name arriving as text.
+            "permissions_checked_at": (
+                datetime.now(timezone.utc).isoformat() if permissions else None
+            ),
             "is_active": True,
         },
         on_conflict="participant_id,exchange,account_type",
