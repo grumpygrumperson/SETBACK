@@ -14,8 +14,8 @@ moves numbers from one to the other.
 
 Run standalone to rescore without syncing:
 
-    python score.py                 # every participant, daily + hourly
-    python score.py --period daily
+    python score.py                 # every participant, daily
+    python score.py --period daily  # explicit; same thing
 """
 
 import logging
@@ -28,15 +28,32 @@ import metrics
 
 logger = logging.getLogger(__name__)
 
-# Which periods to compute. 'daily' is what the leaderboard ranks on; 'hourly'
-# is stored alongside it as an early-competition signal, because `reliable`
-# needs 20 periods and nobody has 20 DAYS for the first three weeks of a
-# 90-day competition.
+# Which periods to compute. Daily, and only daily.
 #
-# Hourly is deliberately NOT the ranking. Annualising hourly returns by
+# 'hourly' used to be stored beside it as an early-competition signal, on the
+# grounds that `reliable` needs 20 periods and nobody has 20 DAYS in the first
+# three weeks. It was never the ranking - annualising hourly returns by
 # sqrt(8760) rewards an account that simply sits still, which is the opposite
-# of what this competition is measuring.
-PERIODS = ("daily", "hourly")
+# of what this competition measures.
+#
+# It is gone for two independent reasons, either sufficient on its own:
+#
+#   1. It contradicts the ranking in public. On live data one participant
+#      scored -1.836 daily and +1.885 hourly - same account, same week,
+#      opposite sign. Publishing both invites a disputed rank to be argued
+#      with whichever number flatters the arguer.
+#
+#   2. It cannot survive the cron interval. An hourly axis needs an hourly
+#      snapshot. At the 3-hour cadence this service actually ran at, two of
+#      every three hourly periods were holes; and since
+#      build_portfolio_series writes a venue off after 3 stale periods, one
+#      additional missed run books every venue out as a withdrawal and back
+#      in as a join - fabricating structural adjustments from nothing.
+#
+# Dropping it is also what allows scoring to read daily_balances rather than
+# every snapshot ever written. See metrics._SNAPSHOT_SOURCES for the size of
+# that difference.
+PERIODS = ("daily",)
 
 # Columns of participant_scores that come straight from metrics' result dict,
 # mapped from its key to the column name where they differ.
@@ -143,6 +160,37 @@ def score_participant(participant_id: str, period: str,
     return row
 
 
+def _drop_retired_periods() -> None:
+    """
+    Delete score rows for periods this module no longer computes.
+
+    Without this the hourly rows written before that period was dropped sit
+    in participant_scores indefinitely, carrying a computed_at that makes
+    them look current. The leaderboard view filters on period = 'daily' and
+    is unaffected - but anyone querying participant_scores directly, which is
+    the natural thing to do when investigating a disputed rank, gets a
+    number nobody stands behind any more.
+
+    Compares against the module-level PERIODS rather than the caller's
+    argument on purpose: PERIODS declares what SHOULD exist, so
+    `--period daily` still clears retired rows instead of depending on which
+    subset happened to be requested.
+
+    The select is unpaginated because the table holds exactly one row per
+    participant per period - a few hundred rows at this competition's size.
+    """
+    existing = (metrics.supabase.table("participant_scores")
+                .select("period").execute().data) or []
+
+    retired = sorted({row["period"] for row in existing} - set(PERIODS))
+    if not retired:
+        return
+
+    metrics.supabase.table("participant_scores").delete().in_("period", retired).execute()
+    logger.info("Removed score row(s) for retired period(s): %s",
+                ", ".join(retired))
+
+
 def write_all_scores(periods: tuple = PERIODS) -> dict:
     """
     Score every participant and upsert the results.
@@ -161,7 +209,12 @@ def write_all_scores(periods: tuple = PERIODS) -> dict:
         logger.warning("No participants to score")
         return {"participants": 0, "rows": 0, "scored": 0, "unscored": 0}
 
-    snapshots_by = metrics.fetch_snapshots_for(ids)
+    # A daily axis can be built from daily rows; anything finer cannot. Ask
+    # for what the requested periods actually require rather than assuming,
+    # so `--period hourly` stays correct if it is ever wanted again.
+    resolution = "daily" if set(periods) <= {"daily"} else "full"
+
+    snapshots_by = metrics.fetch_snapshots_for(ids, resolution=resolution)
     flows_by = metrics.fetch_cash_flows_for(ids)
 
     rows = []
@@ -179,6 +232,8 @@ def write_all_scores(periods: tuple = PERIODS) -> dict:
     metrics.supabase.table("participant_scores").upsert(
         rows, on_conflict="participant_id,period"
     ).execute()
+
+    _drop_retired_periods()
 
     scored = sum(1 for r in rows if r["sharpe"] is not None)
     summary = {
