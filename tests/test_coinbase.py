@@ -9,6 +9,7 @@ misclassification bug lived.
 import pytest
 
 coinbase = pytest.importorskip("coinbase")
+venue_common = pytest.importorskip("venue_common")
 
 
 # ---------------------------------------------------------------------------
@@ -72,27 +73,27 @@ def test_lowercase_product_type_is_handled():
 # ---------------------------------------------------------------------------
 
 def test_amount_unwraps_a_bare_string():
-    assert coinbase._amount("12.0897") == pytest.approx(12.0897)
+    assert venue_common.money_amount("12.0897") == pytest.approx(12.0897)
 
 
 def test_amount_unwraps_a_money_object():
     """INTX returns amounts both ways, sometimes in the same response."""
-    assert coinbase._amount({"value": "12.0897", "currency": "USDC"}) == pytest.approx(12.0897)
+    assert venue_common.money_amount({"value": "12.0897", "currency": "USDC"}) == pytest.approx(12.0897)
 
 
 def test_amount_of_none_is_the_default():
-    assert coinbase._amount(None) == 0.0
-    assert coinbase._amount(None, default=-1.0) == -1.0
+    assert venue_common.money_amount(None) == 0.0
+    assert venue_common.money_amount(None, default=-1.0) == -1.0
 
 
 def test_amount_of_garbage_is_the_default():
-    assert coinbase._amount("not a number") == 0.0
-    assert coinbase._amount({"value": None}) == 0.0
+    assert venue_common.money_amount("not a number") == 0.0
+    assert venue_common.money_amount({"value": None}) == 0.0
 
 
 def test_amount_accepts_numbers():
-    assert coinbase._amount(5) == 5.0
-    assert coinbase._amount(5.5) == 5.5
+    assert venue_common.money_amount(5) == 5.0
+    assert venue_common.money_amount(5.5) == 5.5
 
 
 # ---------------------------------------------------------------------------
@@ -247,21 +248,21 @@ class FakeExchange:
 
 
 def test_resolve_since_passes_milliseconds_through():
-    assert coinbase._resolve_since(FakeExchange(), 1_700_000_000_000) == 1_700_000_000_000
+    assert venue_common.resolve_since(FakeExchange(), 1_700_000_000_000) == 1_700_000_000_000
 
 
 def test_resolve_since_parses_iso8601():
-    assert coinbase._resolve_since(FakeExchange(), "2026-01-01T00:00:00Z") == \
-        coinbase._resolve_since(FakeExchange(), None)
+    assert venue_common.resolve_since(FakeExchange(), "2026-01-01T00:00:00Z") == \
+        venue_common.resolve_since(FakeExchange(), None)
 
 
 def test_resolve_since_defaults_to_competition_start():
-    assert coinbase._resolve_since(FakeExchange(), None) is not None
+    assert venue_common.resolve_since(FakeExchange(), None) is not None
 
 
 def test_resolve_since_rejects_garbage():
     with pytest.raises(ValueError, match="ISO8601"):
-        coinbase._resolve_since(FakeExchange(), "not a date")
+        venue_common.resolve_since(FakeExchange(), "not a date")
 
 
 # ---------------------------------------------------------------------------
@@ -288,3 +289,234 @@ def test_constants_are_not_shadowed_by_local_copies():
         source = inspect.getsource(fn)
         assert "USD_EQUIVALENTS = {" not in source, f"{fn.__name__} shadows the constant"
         assert "QUOTE_PRIORITY = [" not in source, f"{fn.__name__} shadows the constant"
+
+
+# ---------------------------------------------------------------------------
+# Wallet pagination
+#
+# ccxt's fetch_balance sends limit=250 and parses a single page - there is no
+# cursor loop in it. Coinbase creates a wallet per asset a participant has
+# ever held or enabled, so an active account passes 250 and everything after
+# that is absent from the balance with nothing to say so.
+# ---------------------------------------------------------------------------
+
+class _PagedExchange:
+    """Reports a balance, then serves further wallet pages on request."""
+
+    def __init__(self, first_page, pages=()):
+        self.id = "coinbase"
+        self._first = first_page
+        self._pages = list(pages)
+        self.page_requests = []
+
+    def fetch_balance(self, params=None):
+        return self._first
+
+    def v3PrivateGetBrokerageAccounts(self, request):
+        self.page_requests.append(request.get("cursor"))
+        return self._pages.pop(0)
+
+
+def _wallet(currency, available, hold="0"):
+    return {"currency": currency,
+            "available_balance": {"value": available, "currency": currency},
+            "hold": {"value": hold, "currency": currency}}
+
+
+def test_single_page_balance_costs_no_extra_requests():
+    """The common case must stay one request."""
+    ex = _PagedExchange({"total": {"BTC": 1.0}, "info": {"has_next": False}})
+    assert coinbase._wallet_totals(ex, "spot") == {"BTC": 1.0}
+    assert ex.page_requests == []
+
+
+def test_wallets_past_the_first_page_are_not_lost():
+    """
+    The silent one. Without this the participant's holdings in wallet 251
+    onward are valued at zero on the leaderboard, and it gets worse the more
+    assets they trade.
+    """
+    ex = _PagedExchange(
+        {"total": {"BTC": 1.0}, "info": {"has_next": True, "cursor": "c1"}},
+        pages=[{"accounts": [_wallet("ETH", "2.5")], "has_next": False}],
+    )
+    assert coinbase._wallet_totals(ex, "spot") == {"BTC": 1.0, "ETH": 2.5}
+    assert ex.page_requests == ["c1"]
+
+
+def test_held_funds_count_toward_the_total():
+    """
+    `total` is available + hold. A coin sitting in an open order is still the
+    participant's money.
+    """
+    ex = _PagedExchange(
+        {"total": {}, "info": {"has_next": True, "cursor": "c1"}},
+        pages=[{"accounts": [_wallet("SOL", "1.5", hold="0.5")], "has_next": False}],
+    )
+    assert coinbase._wallet_totals(ex, "spot")["SOL"] == 2.0
+
+
+def test_extra_pages_are_walked_to_the_end():
+    ex = _PagedExchange(
+        {"total": {}, "info": {"has_next": True, "cursor": "c1"}},
+        pages=[
+            {"accounts": [_wallet("ETH", "1")], "has_next": True, "cursor": "c2"},
+            {"accounts": [_wallet("SOL", "2")], "has_next": False},
+        ],
+    )
+    assert coinbase._wallet_totals(ex, "spot") == {"ETH": 1.0, "SOL": 2.0}
+    assert ex.page_requests == ["c1", "c2"]
+
+
+def test_pagination_stops_at_the_page_cap():
+    """
+    A cursor that never terminates must not spin forever - the run has a cron
+    window to fit inside.
+    """
+    class Endless(_PagedExchange):
+        def v3PrivateGetBrokerageAccounts(self, request):
+            self.page_requests.append(request.get("cursor"))
+            return {"accounts": [], "has_next": True, "cursor": "again"}
+
+    ex = Endless({"total": {}, "info": {"has_next": True, "cursor": "c1"}})
+    coinbase._wallet_totals(ex, "spot")
+    assert len(ex.page_requests) < coinbase._MAX_ACCOUNT_PAGES + 1
+
+
+# ---------------------------------------------------------------------------
+# Per-currency transfer lookups
+# ---------------------------------------------------------------------------
+
+class _AccountsExchange:
+    def __init__(self, accounts=None, raises=False):
+        self.id = "coinbase"
+        self.accounts = None
+        self._accounts = accounts
+        self._raises = raises
+        self.load_calls = 0
+
+    def load_accounts(self):
+        self.load_calls += 1
+        if self._raises:
+            raise RuntimeError("permission denied")
+        self.accounts = self._accounts
+        return self.accounts
+
+
+def test_usable_account_index_loads_once():
+    ex = _AccountsExchange(accounts=[{"id": "u", "code": "BTC"}])
+    assert coinbase._account_index_is_usable(ex) is True
+    assert ex.load_calls == 1
+
+
+def test_empty_account_list_is_reported_unusable():
+    """
+    An INTX key sees no v3 brokerage accounts. ccxt's load_accounts only
+    caches a NON-empty list, so every per-currency lookup re-downloads the
+    whole list before failing to find its wallet - 33 identical requests and
+    11.8s on one live perp credential, to produce nothing.
+    """
+    ex = _AccountsExchange(accounts=[])
+    assert coinbase._account_index_is_usable(ex) is False
+
+
+def test_account_listing_failure_degrades_instead_of_raising():
+    ex = _AccountsExchange(raises=True)
+    assert coinbase._account_index_is_usable(ex) is False
+
+
+# ---------------------------------------------------------------------------
+# Cash-flow scope
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Read-only enforcement
+#
+# The competition needs exactly one capability - reading a balance. Every
+# capability beyond that is a liability held on the participant's behalf, and
+# a key that can withdraw is custody.
+#
+# Response shape verified live against a real CDP key:
+#   {'can_view': True, 'can_trade': False, 'can_transfer': False,
+#    'portfolio_uuid': '019ffaf3-...', 'portfolio_type': 'INTX'}
+# ---------------------------------------------------------------------------
+
+def _perms(view=True, trade=False, transfer=False, ptype="DEFAULT"):
+    return {"can_view": view, "can_trade": trade, "can_transfer": transfer,
+            "portfolio_uuid": "uuid-1", "portfolio_type": ptype}
+
+
+def test_a_view_only_key_passes():
+    coinbase.assert_read_only(_perms())
+
+
+def test_a_key_that_can_withdraw_is_refused():
+    """Custody. The worst of the three, so it is checked first."""
+    with pytest.raises(ValueError, match="WITHDRAW"):
+        coinbase.assert_read_only(_perms(transfer=True))
+
+
+def test_a_key_that_can_trade_is_refused():
+    """
+    Even if never used, holding it means the competition COULD trade on a
+    participant's account - the accusation you cannot disprove after a
+    disputed result.
+    """
+    with pytest.raises(ValueError, match="TRADE"):
+        coinbase.assert_read_only(_perms(trade=True))
+
+
+def test_a_key_that_cannot_even_read_is_refused():
+    with pytest.raises(ValueError, match="cannot read"):
+        coinbase.assert_read_only(_perms(view=False))
+
+
+def test_unknown_permissions_are_refused_not_assumed_safe():
+    """
+    The one that decides whether this control is real. An empty response means
+    the check did not run, and "the check failed so we let it through" is how
+    a security control becomes decorative.
+    """
+    with pytest.raises(ValueError, match="cannot be confirmed read-only"):
+        coinbase.assert_read_only({})
+
+
+def test_withdraw_is_reported_even_when_trade_is_also_set():
+    """The more severe capability should be the one named."""
+    with pytest.raises(ValueError, match="WITHDRAW"):
+        coinbase.assert_read_only(_perms(trade=True, transfer=True))
+
+
+def test_permissions_are_read_from_a_flat_response():
+    class Ex:
+        def v3PrivateGetBrokerageKeyPermissions(self):
+            return _perms()
+
+    assert coinbase.read_key_permissions(Ex())["can_view"] is True
+
+
+def test_permissions_are_also_read_from_a_wrapped_response():
+    """Defensive: Coinbase has wrapped payloads under 'results' elsewhere."""
+    class Ex:
+        def v3PrivateGetBrokerageKeyPermissions(self):
+            return {"results": _perms(transfer=True)}
+
+    assert coinbase.read_key_permissions(Ex())["can_transfer"] is True
+
+
+def test_an_empty_response_becomes_an_empty_dict_not_none():
+    """So assert_read_only's 'unknown' branch fires instead of a TypeError."""
+    class Ex:
+        def v3PrivateGetBrokerageKeyPermissions(self):
+            return None
+
+    assert coinbase.read_key_permissions(Ex()) == {}
+
+
+def test_coinbase_declares_its_transfers_account_wide():
+    """
+    The sync reads this to decide that ONE credential per participant
+    collects Coinbase transfers. Flipping it to False would store every
+    deposit twice for anyone holding both a spot and a perp key.
+    """
+    assert coinbase.CASH_FLOWS_ARE_ACCOUNT_WIDE is True

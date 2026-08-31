@@ -17,27 +17,48 @@ ccxt = pytest.importorskip("ccxt")
 FAKE_L1 = "0x" + "a" * 64
 
 
+@pytest.fixture
+def allow_wallet_keys(monkeypatch):
+    """
+    Opt in to the wallet-private-key path.
+
+    The competition refuses wallet keys outright - see the refusal tests
+    below. The path still exists for exchange_from_env(), where the operator
+    is testing against their OWN wallet on their own machine, so the tests
+    that cover it have to opt in exactly the way that operator does.
+
+    Requiring the flag here is deliberate: if the refusal were ever removed,
+    these tests would keep passing while the refusal tests failed, and it
+    would be obvious which behaviour changed.
+    """
+    monkeypatch.setenv("ALLOW_WALLET_KEYS", "1")
+
+
 # ---------------------------------------------------------------------------
 # build_exchange
 # ---------------------------------------------------------------------------
 
-def test_builds_from_a_plaintext_key():
+def test_builds_from_a_plaintext_key(allow_wallet_keys):
     ex = lighter.build_exchange(FAKE_L1, encrypted=False)
     assert ex.id == "lighter"
     assert ex.privateKey == FAKE_L1
 
 
-def test_account_index_reaches_ccxt_options():
+def test_account_index_reaches_ccxt_options(allow_wallet_keys):
     """Stored at signup so the sync doesn't re-derive it every run."""
     ex = lighter.build_exchange(FAKE_L1, encrypted=False, account_index=1077)
     assert ex.options["accountIndex"] == 1077
 
 
-def test_api_key_blob_is_rejected_with_an_actionable_message():
+def test_api_key_blob_is_rejected_with_an_actionable_message(allow_wallet_keys):
     """
     Lighter issues 40-byte (80 hex char) API keys, and ccxt wants the 32-byte
     L1 wallet key. Pasting the wrong one is the likeliest setup mistake, and
     ccxt's own error points at a FAQ rather than saying which key it wants.
+
+    Only reachable by the operator now - a participant submitting this gets
+    the read-only-token refusal instead, which is the more useful answer for
+    them since no private key of any length would be accepted.
     """
     api_key_blob = "b" * 80
     with pytest.raises(ValueError, match="L1 private key"):
@@ -49,16 +70,55 @@ def test_missing_key_is_rejected():
         lighter.build_exchange("", encrypted=False)
 
 
-def test_encrypted_key_round_trips():
-    from coinbase import _get_fernet
-    token = _get_fernet().encrypt(FAKE_L1.encode()).decode()
+def test_encrypted_key_round_trips(allow_wallet_keys):
+    from venue_common import get_fernet
+    token = get_fernet().encrypt(FAKE_L1.encode()).decode()
     ex = lighter.build_exchange(token, encrypted=True)
     assert ex.privateKey == FAKE_L1
 
 
-def test_undecryptable_key_names_the_likely_cause():
+def test_undecryptable_key_names_the_likely_cause(allow_wallet_keys):
     with pytest.raises(ValueError, match="FERNET_KEY"):
         lighter.build_exchange("not-a-fernet-token", encrypted=True)
+
+
+# ---------------------------------------------------------------------------
+# Wallet private keys are refused
+#
+# A read-only token is scoped and expires; a wallet private key controls every
+# asset in the wallet on every chain and cannot be revoked. Accepting one makes
+# this service the custodian of a competitor's wallet, permanently, for a
+# competition that only ever needed to read a balance. It is the one mistake
+# here that cannot be undone afterwards.
+# ---------------------------------------------------------------------------
+
+def test_a_wallet_private_key_is_refused_by_default():
+    with pytest.raises(ValueError, match="WALLET PRIVATE KEY"):
+        lighter.build_exchange(FAKE_L1, encrypted=False)
+
+
+def test_the_refusal_says_what_to_do_instead():
+    """An error a participant can act on, not just a rejection."""
+    with pytest.raises(ValueError, match="read-only token"):
+        lighter.build_exchange(FAKE_L1, encrypted=False)
+
+
+def test_a_stored_wallet_key_stops_working_too():
+    """
+    The check lives in build_exchange, not only in verify_credential, because
+    signup validation does nothing about a wallet key ALREADY sitting in
+    participant_api_keys. Without this the sync would keep using it forever.
+    """
+    from venue_common import get_fernet
+    stored = get_fernet().encrypt(FAKE_L1.encode()).decode()
+    with pytest.raises(ValueError, match="WALLET PRIVATE KEY"):
+        lighter.build_exchange(stored, encrypted=True)
+
+
+def test_tokens_are_unaffected_by_the_refusal():
+    """The refusal must not cost the credential type we actually want."""
+    ex = lighter.build_exchange(token(), encrypted=False)
+    assert ex.id == "lighter"
 
 
 # ---------------------------------------------------------------------------
@@ -93,7 +153,7 @@ def test_spot_is_refused():
     Returning an empty balance would read as a participant with no money.
     Refusing says the credential was registered wrong.
     """
-    ex = lighter.build_exchange(FAKE_L1, encrypted=False)
+    ex = lighter.build_exchange(token(), encrypted=False)
     with pytest.raises(ValueError, match="no 'spot' account"):
         lighter.get_account_totals_usdc(ex, account_type="spot")
 
@@ -239,11 +299,16 @@ def test_orders_are_stamped_for_the_sync_to_fill_in(fills):
     assert order["account_type"] == "perp"
 
 
-def test_wallet_address_is_rejected_as_a_key():
+def test_wallet_address_is_rejected_as_a_key(allow_wallet_keys):
     """
     An address is 42 chars, short enough to pass the length check, so ccxt
     would derive a different address from it and Lighter would answer
     "account not found" - indistinguishable from a real but unfunded wallet.
+
+    Operator-path only now. A participant pasting an address gets the
+    read-only-token refusal, which is the better answer for them: telling
+    them "that's an address, not a private key" would imply a private key
+    was what we wanted.
     """
     address = "0x" + "3c03630c49b74c481d8458fa31e05828bf170bc3"
     with pytest.raises(ValueError, match="ADDRESS, not a private key"):
@@ -349,16 +414,103 @@ def test_build_exchange_routes_a_token_to_the_token_path():
 
 
 def test_build_exchange_routes_an_encrypted_token_too():
-    from coinbase import _get_fernet
-    sealed = _get_fernet().encrypt(token().encode()).decode()
+    from venue_common import get_fernet
+    sealed = get_fernet().encrypt(token().encode()).decode()
     ex = lighter.build_exchange(sealed, encrypted=True)
     assert ex.privateKey is None
     assert ex.options["accountIndex"] == 741152
 
 
-def test_private_key_still_works_alongside_tokens():
-    ex = lighter.build_exchange(FAKE_L1, encrypted=False)
-    assert ex.privateKey == FAKE_L1
+def test_a_private_key_is_refused_where_a_token_is_accepted():
+    """
+    Both credential types share one column, so build_exchange routes on the
+    'ro:' prefix. This asserts the routing now REFUSES the branch it used to
+    accept, while the token branch is untouched - the two must not have been
+    broken together.
+    """
+    assert lighter.build_exchange(token(), encrypted=False).id == "lighter"
+
+    with pytest.raises(ValueError, match="WALLET PRIVATE KEY"):
+        lighter.build_exchange(FAKE_L1, encrypted=False)
+
+
+# ---------------------------------------------------------------------------
+# verify_credential — the signup gate
+#
+# Everything asserted here fails BEFORE any network call, which is what makes
+# it testable offline. The live fetch_balance() that follows is not exercised.
+# ---------------------------------------------------------------------------
+
+def test_signup_rejects_a_wallet_private_key():
+    """
+    The gate that matters. Rejected on the SHAPE of the value, not on whether
+    it works - a wallet key authenticates perfectly well, which is exactly the
+    problem.
+    """
+    with pytest.raises(ValueError, match="not a Lighter read-only token"):
+        lighter.verify_credential({"api_key": FAKE_L1, "account_type": "perp"})
+
+
+def test_signup_rejects_a_wallet_key_even_with_the_operator_flag(monkeypatch):
+    """
+    ALLOW_WALLET_KEYS exists for the operator testing their own wallet from
+    their own machine. It must never let a PARTICIPANT register one.
+    """
+    monkeypatch.setenv("ALLOW_WALLET_KEYS", "1")
+    with pytest.raises(ValueError, match="not a Lighter read-only token"):
+        lighter.verify_credential({"api_key": FAKE_L1, "account_type": "perp"})
+
+
+def test_signup_rejects_a_wallet_address():
+    address = "0x" + "3c03630c49b74c481d8458fa31e05828bf170bc3"
+    with pytest.raises(ValueError, match="not a Lighter read-only token"):
+        lighter.verify_credential({"api_key": address, "account_type": "perp"})
+
+
+def test_signup_rejects_spot_before_touching_the_network():
+    with pytest.raises(ValueError, match="no 'spot' market"):
+        lighter.verify_credential({"api_key": token(), "account_type": "spot"})
+
+
+def test_signup_rejects_an_expired_token():
+    import time
+    expired = token(deadline=int(time.time()) - 86400)
+    with pytest.raises(ValueError, match="expired"):
+        lighter.verify_credential({"api_key": expired, "account_type": "perp"})
+
+
+def test_signup_rejects_a_malformed_token():
+    with pytest.raises(ValueError, match="read-only token"):
+        lighter.verify_credential({"api_key": "ro:nope", "account_type": "perp"})
+
+
+# ---------------------------------------------------------------------------
+# Token scope
+# ---------------------------------------------------------------------------
+
+def test_unrecognised_scope_is_warned_about_not_rejected(caplog):
+    """
+    Lighter's scope vocabulary is unconfirmed - only 'all' has been observed.
+    Enforcing an allowlist built on one observation would reject valid tokens,
+    so this warns until the real values are known.
+    """
+    details = lighter.parse_readonly_token(token(scope="something-new"))
+    with caplog.at_level("WARNING"):
+        lighter._check_token_scope(details)
+    assert "unrecognised scope" in caplog.text
+
+
+def test_scope_can_be_enforced_once_the_vocabulary_is_known(monkeypatch):
+    monkeypatch.setenv("LIGHTER_ENFORCE_SCOPE", "1")
+    details = lighter.parse_readonly_token(token(scope="something-new"))
+    with pytest.raises(ValueError, match="scope"):
+        lighter._check_token_scope(details)
+
+
+def test_an_allowed_scope_passes_under_enforcement(monkeypatch):
+    monkeypatch.setenv("LIGHTER_ENFORCE_SCOPE", "1")
+    monkeypatch.setenv("LIGHTER_ALLOWED_SCOPES", "all,read")
+    lighter._check_token_scope(lighter.parse_readonly_token(token(scope="read")))
 
 
 def test_find_account_index_uses_the_token_without_an_api_call():

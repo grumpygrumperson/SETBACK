@@ -339,3 +339,110 @@ def test_too_few_returns_raises():
 def test_sharpe_ratio_needs_three_values():
     with pytest.raises(ValueError, match="at least 3"):
         metrics.sharpe_ratio([100.0, 110.0])
+
+
+# ---------------------------------------------------------------------------
+# Paged reads
+#
+# PostgREST caps a response at Supabase's `max-rows` and says nothing about
+# it - a normal 200 with fewer rows. Snapshots are read oldest-first, so a
+# truncated read keeps the OLDEST rows and every Sharpe would be computed
+# from a window that stops advancing while still looking plausible.
+# ---------------------------------------------------------------------------
+
+class _PagedTable:
+    """A query object that serves `rows` in slices, honouring a server cap."""
+
+    def __init__(self, rows, server_cap=None):
+        self._rows = rows
+        self._cap = server_cap
+        self.ranges = []
+        self._range = (0, len(rows))
+
+    # the chainable bits metrics.py uses
+    def select(self, *a, **k):
+        return self
+
+    def eq(self, *a, **k):
+        return self
+
+    def order(self, *a, **k):
+        return self
+
+    def range(self, start, end):
+        self._range = (start, end)
+        return self
+
+    def execute(self):
+        start, end = self._range
+        self.ranges.append((start, end))
+        size = end - start + 1
+        if self._cap is not None:
+            size = min(size, self._cap)
+        return type("R", (), {"data": self._rows[start:start + size]})
+
+
+def _rows(n):
+    return [{"i": i} for i in range(n)]
+
+
+def test_a_single_page_is_read_in_one_request():
+    table = _PagedTable(_rows(10))
+    assert metrics._fetch_all(lambda: table, "test") == _rows(10)
+    assert len(table.ranges) == 2      # the data page, then the empty one
+
+
+def test_every_row_is_read_when_there_are_several_pages():
+    table = _PagedTable(_rows(2500))
+    assert metrics._fetch_all(lambda: table, "test") == _rows(2500)
+
+
+def test_a_server_cap_below_the_page_size_still_reads_everything():
+    """
+    The subtle one. Stepping by the page size ASKED FOR rather than the rows
+    actually returned would skip everything between the server's cap and the
+    stride - reading a fraction of the table while looking like a full scan.
+    """
+    table = _PagedTable(_rows(2500), server_cap=400)
+    assert metrics._fetch_all(lambda: table, "test") == _rows(2500)
+
+
+def test_pages_do_not_overlap_or_leave_holes():
+    table = _PagedTable(_rows(2500), server_cap=400)
+    metrics._fetch_all(lambda: table, "test")
+
+    starts = [start for start, _ in table.ranges]
+    assert starts == sorted(starts)
+    assert starts[:4] == [0, 400, 800, 1200]
+
+
+def test_an_empty_table_reads_cleanly():
+    table = _PagedTable([])
+    assert metrics._fetch_all(lambda: table, "test") == []
+
+
+def test_reading_stops_at_the_row_ceiling(monkeypatch):
+    """
+    A participant with a million snapshots is a bug, not a trader - and
+    pulling it would take the whole metrics run down.
+    """
+    monkeypatch.setattr(metrics, "_MAX_FETCH_ROWS", 2000)
+    table = _PagedTable(_rows(100_000))
+    assert len(metrics._fetch_all(lambda: table, "test")) == 2000
+
+
+def test_an_unpriceable_transfer_does_not_take_down_the_participant():
+    """
+    usdc_value is nullable - a transfer in a currency that couldn't be priced
+    stores NULL rather than a wrong number. float(None) would raise inside the
+    pairing loop and cost this participant their entire Sharpe over one
+    unpriceable transfer.
+    """
+    flows = [
+        {"exchange": "coinbase", "account_type": "spot", "timestamp": ts(1),
+         "direction": "out", "usdc_value": None},
+        {"exchange": "lighter", "account_type": "perp", "timestamp": ts(1) + 1000,
+         "direction": "in", "usdc_value": 100.0},
+    ]
+    marked = metrics.mark_internal_transfers(flows)
+    assert [f["is_internal"] for f in marked] == [False, False]
