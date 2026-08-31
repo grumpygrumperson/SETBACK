@@ -234,6 +234,89 @@ def build_exchange_from_token(token: str, encrypted: bool = True,
     return exchange
 
 
+def _check_token_scope(details: dict) -> None:
+    """
+    Look at the `scope` segment of a read-only token.
+
+    parse_readonly_token has always extracted this field and nothing has ever
+    read it. That is worth fixing, but carefully: Lighter's scope vocabulary
+    is NOT documented anywhere I can verify, and the only value observed so
+    far is 'all'. Enforcing an allowlist built on one observation would reject
+    valid tokens.
+
+    So this warns by default and enforces only when asked. Run a signup round,
+    read the warnings to learn what Lighter actually issues, put the real
+    values in LIGHTER_ALLOWED_SCOPES, then set LIGHTER_ENFORCE_SCOPE=1.
+
+    This is defence in depth, not the load-bearing control. The 'ro:' prefix
+    is what actually guarantees the credential cannot trade - Lighter mints
+    these tokens and a read-only one has no power to sign an order, whatever
+    its scope says.
+    """
+    scope = (details.get('scope') or '').strip()
+    allowed = {s.strip() for s in
+               os.getenv("LIGHTER_ALLOWED_SCOPES", "all").split(",") if s.strip()}
+
+    if scope in allowed:
+        return
+
+    enforce = os.getenv("LIGHTER_ENFORCE_SCOPE", "").strip().lower() in ("1", "true", "yes")
+    if enforce:
+        raise ValueError(
+            f"Lighter token scope '{scope}' is not in the allowed set "
+            f"{sorted(allowed)}. Set LIGHTER_ALLOWED_SCOPES if this scope is "
+            f"legitimate."
+        )
+
+    logger.warning(
+        "Lighter token for account %s has unrecognised scope %r (allowed: %s). "
+        "Accepted, because the scope vocabulary is unconfirmed - add it to "
+        "LIGHTER_ALLOWED_SCOPES once you know it is read-only.",
+        details.get('account_index'), scope, sorted(allowed),
+    )
+
+
+def _refuse_wallet_key() -> None:
+    """
+    Refuse to authenticate Lighter with an L1 wallet private key.
+
+    A read-only token is scoped and expiring; a wallet private key is neither.
+    It controls every asset in that wallet on every chain, it cannot be made
+    read-only, and it cannot be revoked - "rotating" it means moving all the
+    funds somewhere else. Accepting one makes this service the custodian of a
+    competitor's entire wallet, permanently, for a competition that only ever
+    needed to READ their balance.
+
+    That is the one mistake here that cannot be undone afterwards, which is
+    why the check is a hard refusal rather than a warning.
+
+    It lives in build_exchange rather than only in verify_credential on
+    purpose: signup-time validation protects new registrations, but a wallet
+    key already sitting in participant_api_keys would otherwise keep working
+    forever. Refusing on the path every credential actually goes through
+    covers both.
+
+    ALLOW_WALLET_KEYS exists for exchange_from_env(), where the operator is
+    testing against their OWN wallet from their own machine. It must never be
+    set on the deployed service.
+    """
+    if os.getenv("ALLOW_WALLET_KEYS", "").strip().lower() in ("1", "true", "yes"):
+        logger.warning(
+            "ALLOW_WALLET_KEYS is set - authenticating Lighter with a wallet "
+            "private key. This must never be set on the deployed service."
+        )
+        return
+
+    raise ValueError(
+        "Refusing to use a Lighter WALLET PRIVATE KEY. This competition only "
+        "reads balances, so it accepts read-only tokens only - a token starts "
+        "'ro:', cannot move funds, and expires on its own. A wallet private "
+        "key controls every asset in the wallet on every chain and cannot be "
+        "revoked. Generate a read-only token in the Lighter UI and register "
+        "that instead."
+    )
+
+
 def build_exchange(private_key: str, encrypted: bool = True,
                    account_index=None, api_key_index=None,
                    **options) -> ccxt.Exchange:
@@ -257,6 +340,10 @@ def build_exchange(private_key: str, encrypted: bool = True,
     instead. Both credential types live in the same column, so the sync
     doesn't need to know which a participant registered - and a token is the
     better answer for everyone, since it can't move funds.
+
+    THE WALLET-KEY PATH IS REFUSED unless ALLOW_WALLET_KEYS is set. See
+    _refuse_wallet_key() for why, and why the check lives here rather than
+    only at signup.
     """
     if not private_key:
         raise ValueError("A private_key is required")
@@ -277,6 +364,10 @@ def build_exchange(private_key: str, encrypted: bool = True,
             return build_exchange_from_token(
                 probe, encrypted=False,
                 api_key_index=api_key_index or _DEFAULT_API_KEY_INDEX, **options)
+
+    # Everything below this line is the WALLET PRIVATE KEY path. Anything that
+    # reaches it is not a read-only token, so it is refused by default.
+    _refuse_wallet_key()
 
     if encrypted:
         try:
@@ -338,9 +429,12 @@ def verify_credential(row: dict) -> dict:
     `row` is a signup record with at least api_key and account_type; returns
     {'account_type', 'portfolio_uuid', 'passphrase'} for storage.
 
-    Three Lighter-specific checks live here rather than in the importer,
+    Four Lighter-specific checks live here rather than in the importer,
     because they are facts about this venue and nothing else:
 
+      - READ-ONLY TOKENS ONLY. Rejected here, at the point where a human is
+        still watching and the participant can still fix it, rather than
+        leaving build_exchange to refuse it later in an unattended cron.
       - PERPS ONLY, so a row registered as 'spot' is a mistake worth catching
         while the participant can still fix it
       - the whole credential is one value in api_key; there is no secret
@@ -358,15 +452,30 @@ def verify_credential(row: dict) -> dict:
             f"credential as '{ACCOUNT_TYPE}'"
         )
 
-    # Plaintext here; encrypted by the caller once proven to work.
-    exchange = build_exchange(str(row['api_key']).strip(), encrypted=False)
+    credential = str(row['api_key']).strip()
 
-    account_index = find_account_index(exchange)
-    if account_index is None:
+    # Refuse a wallet private key BEFORE building anything with it. Note this
+    # rejects on the shape of the value, not on whether it works: a wallet key
+    # authenticates perfectly well, which is exactly the problem.
+    if not credential.startswith(_TOKEN_PREFIX):
         raise ValueError(
-            "No Lighter account for this credential - the wallet may not have "
-            "deposited yet"
+            f"This is not a Lighter read-only token. A token starts "
+            f"'{_TOKEN_PREFIX}' and cannot move funds; anything else is "
+            f"treated as a wallet private key, which controls every asset in "
+            f"the wallet on every chain and will not be accepted. Generate a "
+            f"read-only token in the Lighter UI and submit that."
         )
+
+    # Parses the token and proves it is well-formed and unexpired. The account
+    # index travels INSIDE the token, so this replaces the find_account_index()
+    # call that used to be here - one fewer API request per registration, and
+    # one fewer way for signup to fail on a network blip.
+    details = parse_readonly_token(credential)
+    _check_token_scope(details)
+
+    # Plaintext here; encrypted by the caller once proven to work.
+    exchange = build_exchange_from_token(credential, encrypted=False)
+    account_index = details['account_index']
 
     exchange.fetch_balance()
 
