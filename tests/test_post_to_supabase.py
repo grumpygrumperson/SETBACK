@@ -5,7 +5,6 @@ Only the pure parts: exit_code_for and _failure_threshold. The sync loop
 itself talks to Supabase and Coinbase and isn't exercised here.
 """
 
-import os
 
 import pytest
 

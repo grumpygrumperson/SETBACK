@@ -21,3 +21,7 @@ readfile.py
 API_endpoints.py
 gen_fernet_key.py
 main.py
+
+# Tooling caches
+.ruff_cache/
+.pytest_cache/

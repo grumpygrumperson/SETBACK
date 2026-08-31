@@ -7,7 +7,13 @@ from dotenv import load_dotenv
 # Competition-wide, not Coinbase's. See venue_common for why these don't live
 # here any more: lighter.py used to import them from this module, which made
 # Coinbase a dependency of a Lighter-only sync.
-from venue_common import (COMPETITION_START, QUOTE_PRIORITY, USD_EQUIVALENTS,
+#
+# COMPETITION_START is re-exported rather than read here - resolve_since()
+# applies it. It stays in this import because every adapter must resolve
+# `since` from ONE date, and tests/test_venues.py asserts that this module
+# carries venue_common's value rather than a redeclared copy of it.
+from venue_common import (COMPETITION_START,  # noqa: F401 - re-export, see above
+                          QUOTE_PRIORITY, USD_EQUIVALENTS,
                           get_fernet, load_shared_markets,
                           load_shared_tickers, money_amount, resolve_since)
 

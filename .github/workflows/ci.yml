@@ -1,0 +1,105 @@
+# Continuous integration.
+#
+# The point of running this in CI rather than trusting a local `pytest` is
+# that CI sees ONLY WHAT WAS COMMITTED. Both failures that have reached main
+# so far were invisible locally for exactly that reason:
+#
+#   - metrics.py referenced venue_common.COMPETITION_END before venue_common
+#     defined it. Both files were correct in the working tree; only one was
+#     committed.
+#   - lighter.py sat untracked while every one of its 539 test lines passed
+#     locally.
+#
+# A fresh checkout is the only thing that reproduces either.
+
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    name: Lint and test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      # Railway deploys with `uv sync --locked`, which REFUSES to resolve and
+      # fails the build outright when uv.lock disagrees with pyproject.toml.
+      # That has already broken one deploy - a dependency was removed from
+      # pyproject without re-running `uv lock`. Catching it here costs two
+      # seconds; catching it on Railway costs a deploy.
+      - name: uv.lock agrees with pyproject.toml
+        run: uv lock --check
+
+      - name: Install dependencies
+        run: uv sync --locked --dev
+
+      - name: Lint
+        run: uv run ruff check .
+
+      # No network is needed: tests/conftest.py installs placeholder Supabase
+      # and Fernet values, and nothing in the suite connects.
+      - name: Test
+        run: uv run pytest -q
+
+  deploy-install:
+    name: Production install (what Railway runs)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      # --no-dev is what the deploy does. A runtime module that quietly
+      # depends on a dev-only package imports fine in the test job above and
+      # fails on Railway; this is the job that tells them apart.
+      - name: Install runtime dependencies only
+        run: uv sync --locked --no-dev
+
+      - name: Every module imports with runtime dependencies only
+        env:
+          SUPABASE_URL: https://placeholder.supabase.co
+          SUPABASE_KEY: placeholder-key-for-ci
+        run: |
+          # Generated, not hard-coded: a Fernet-shaped literal in the
+          # repository is a string every future secret scan has to rule out.
+          # Nothing is encrypted here - the modules only require the variable
+          # to be present at import.
+          FERNET_KEY="$(uv run python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')"
+          export FERNET_KEY
+
+          uv run python - <<'PY'
+          import ast
+          import importlib
+          import pathlib
+
+          # Read the list from the test module rather than repeating it here.
+          # Parsed rather than imported because that module needs pytest,
+          # which --no-dev has deliberately not installed.
+          source = pathlib.Path("tests/test_imports.py").read_text(encoding="utf-8")
+          names = next(
+              ast.literal_eval(node.value)
+              for node in ast.parse(source).body
+              if isinstance(node, ast.Assign)
+              and any(getattr(t, "id", "") == "REQUIRED_MODULES" for t in node.targets)
+          )
+
+          for name in names:
+              importlib.import_module(name)
+              print("ok", name)
+
+          print(f"\n{len(names)} module(s) import with runtime dependencies only")
+          PY

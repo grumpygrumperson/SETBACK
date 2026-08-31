@@ -7,6 +7,8 @@ returning an empty list) is encoded as a fixture below, taken from the real
 response.
 """
 
+import time
+
 import pytest
 
 lighter = pytest.importorskip("lighter")
@@ -322,8 +324,6 @@ def test_wallet_address_is_rejected_as_a_key(allow_wallet_keys):
 # and expires on its own, so collecting one per participant carries no
 # custody risk.
 # ---------------------------------------------------------------------------
-
-import time
 
 SIG = "d" * 64
 
