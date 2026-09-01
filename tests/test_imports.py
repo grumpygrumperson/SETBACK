@@ -44,6 +44,7 @@ REQUIRED_MODULES = (
     "rotate_credentials",
     "score",
     "sign_ups",
+    "signup_crypto",
     "venue_common",
     "venues",
 )

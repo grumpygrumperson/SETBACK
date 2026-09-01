@@ -1,0 +1,425 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Competition signup</title>
+
+<!--
+  Participant signup form.
+
+  Credentials are encrypted IN THE BROWSER before they are submitted. The
+  database receives ciphertext only; nothing here can be decrypted without
+  SIGNUP_PRIVATE_KEY, which lives on the importer machine and is never
+  deployed. See signup_crypto.py.
+
+  HOSTING: any static host. A Supabase Storage public bucket, GitHub Pages,
+  Netlify - it makes no difference, because the page talks to Supabase's REST
+  API directly and holds no secret. Serve it over HTTPS: WebCrypto is
+  unavailable on plain http:// origins other than localhost, and the form
+  will tell the visitor so rather than silently sending plaintext.
+
+  CONFIGURE the three values in CONFIG below before deploying.
+-->
+
+<style>
+  :root {
+    --bg: #ffffff;
+    --fg: #14161a;
+    --muted: #5c6370;
+    --line: #dfe3e8;
+    --field-bg: #ffffff;
+    --accent: #1b6ef3;
+    --accent-fg: #ffffff;
+    --warn-bg: #fff8e6;
+    --warn-line: #e8c974;
+    --warn-fg: #6b4e00;
+    --ok-bg: #e9f7ef;
+    --ok-line: #8fd3ab;
+    --ok-fg: #14532d;
+    --bad-bg: #fdecec;
+    --bad-line: #eda1a1;
+    --bad-fg: #7f1d1d;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #14161a; --fg: #e8eaed; --muted: #9aa3af; --line: #2c3138;
+      --field-bg: #1b1e24; --accent: #4d8df7; --accent-fg: #08111f;
+      --warn-bg: #2e2611; --warn-line: #5e4c15; --warn-fg: #f0d68a;
+      --ok-bg: #10281a; --ok-line: #2f5d40; --ok-fg: #a5e5c0;
+      --bad-bg: #2c1414; --bad-line: #5f2626; --bad-fg: #f0a9a9;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 2rem 1rem 4rem;
+    background: var(--bg); color: var(--fg);
+    font: 16px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 34rem; margin: 0 auto; }
+  h1 { font-size: 1.5rem; margin: 0 0 .35rem; letter-spacing: -.01em; }
+  .sub { color: var(--muted); margin: 0 0 1.75rem; }
+  fieldset { border: 1px solid var(--line); border-radius: 10px; padding: 1.1rem 1.1rem .4rem; margin: 0 0 1.25rem; }
+  legend { padding: 0 .4rem; font-weight: 600; font-size: .82rem; text-transform: uppercase; letter-spacing: .07em; color: var(--muted); }
+  label { display: block; margin-bottom: 1rem; }
+  .lbl { display: block; font-weight: 600; font-size: .9rem; margin-bottom: .3rem; }
+  .hint { display: block; font-weight: 400; color: var(--muted); font-size: .82rem; margin-bottom: .35rem; }
+  input, select {
+    width: 100%; padding: .55rem .65rem; font: inherit; font-size: .95rem;
+    color: var(--fg); background: var(--field-bg);
+    border: 1px solid var(--line); border-radius: 7px;
+  }
+  input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: 1px; border-color: transparent; }
+  input[type=password], input.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .88rem; }
+  button {
+    width: 100%; padding: .7rem 1rem; font: inherit; font-weight: 600;
+    color: var(--accent-fg); background: var(--accent);
+    border: 0; border-radius: 8px; cursor: pointer;
+  }
+  button:disabled { opacity: .55; cursor: not-allowed; }
+  .note { border-radius: 9px; padding: .8rem .9rem; font-size: .88rem; margin: 0 0 1.5rem; }
+  .warn { background: var(--warn-bg); border: 1px solid var(--warn-line); color: var(--warn-fg); }
+  .ok   { background: var(--ok-bg);   border: 1px solid var(--ok-line);   color: var(--ok-fg); }
+  .bad  { background: var(--bad-bg);  border: 1px solid var(--bad-line);  color: var(--bad-fg); }
+  .note ul { margin: .5rem 0 0; padding-left: 1.1rem; }
+  .note code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .85em; }
+  #status { margin-top: 1.25rem; }
+  [hidden] { display: none !important; }
+  footer { margin-top: 2rem; color: var(--muted); font-size: .82rem; }
+</style>
+</head>
+<body>
+<main>
+
+<h1>Competition signup</h1>
+<p class="sub">Register your exchange API credentials to be ranked.</p>
+
+<div class="note warn">
+  <strong>Read-only keys only.</strong> Credentials that can trade or withdraw
+  are rejected automatically — this competition never needs the ability to
+  move your funds.
+  <ul>
+    <li><strong>Coinbase</strong> — create the key with <em>View</em> permission
+        only. Leave <em>Trade</em> and <em>Transfer</em> unchecked.</li>
+    <li><strong>Lighter</strong> — submit a read-only token, which starts with
+        <code>ro:</code>. Never submit your wallet private key; it cannot be
+        revoked and controls every asset in the wallet.</li>
+  </ul>
+</div>
+
+<div id="insecure" class="note bad" hidden>
+  This page is not being served over HTTPS, so your browser will not provide
+  the encryption this form depends on. Do not enter credentials here.
+</div>
+
+<form id="signup" autocomplete="off">
+  <fieldset>
+    <legend>You</legend>
+    <label>
+      <span class="lbl">Display name</span>
+      <span class="hint">Shown on the public leaderboard.</span>
+      <input name="display_name" required maxlength="40">
+    </label>
+    <label>
+      <span class="lbl">Email</span>
+      <span class="hint">Used only to contact you if your key stops working.</span>
+      <input name="email" type="email" required maxlength="320">
+    </label>
+  </fieldset>
+
+  <fieldset>
+    <legend>Venue</legend>
+    <label>
+      <span class="lbl">Exchange</span>
+      <select name="exchange" id="exchange">
+        <option value="coinbase">Coinbase</option>
+        <option value="lighter">Lighter</option>
+      </select>
+    </label>
+    <label id="account-type-field">
+      <span class="lbl">Account type</span>
+      <select name="account_type" id="account_type">
+        <option value="spot">Spot</option>
+        <option value="perp">Perpetuals</option>
+      </select>
+    </label>
+  </fieldset>
+
+  <fieldset>
+    <legend>Credentials</legend>
+    <label>
+      <span class="lbl" id="key-label">API key</span>
+      <span class="hint" id="key-hint">The key's public identifier.</span>
+      <input name="api_key" id="api_key" class="mono" required>
+    </label>
+    <label id="secret-field">
+      <span class="lbl">API secret</span>
+      <input name="api_secret" id="api_secret" type="password" class="mono">
+    </label>
+    <label id="passphrase-field">
+      <span class="lbl">Passphrase <span class="hint" style="display:inline">— if your key has one</span></span>
+      <input name="api_passphrase" type="password" class="mono">
+    </label>
+  </fieldset>
+
+  <button type="submit" id="submit">Encrypt and submit</button>
+</form>
+
+<div id="status"></div>
+
+<footer>
+  Your credentials are encrypted in this browser before they are sent. The
+  database stores ciphertext only.
+</footer>
+
+</main>
+
+<script>
+// ===== BEGIN PORTABLE CRYPTO =====================================================
+// Everything between these markers is extracted verbatim and executed under
+// Node by tests/test_signup_crypto.py, which then decrypts the result with
+// signup_crypto.py. That test is the only thing that can catch the two
+// implementations drifting apart - a mismatch here does not fail loudly, it
+// produces submissions nobody can ever open.
+//
+// Keep it free of DOM references so it stays runnable outside a browser.
+
+const CONTEXT = "SETAPI-signup-v1";     // must equal signup_crypto.CONTEXT
+const ENVELOPE_VERSION = 1;
+
+function b64encode(bytes) {
+  const arr = new Uint8Array(bytes);
+  let binary = "";
+  for (let i = 0; i < arr.length; i++) binary += String.fromCharCode(arr[i]);
+  return btoa(binary);
+}
+
+function b64decode(text) {
+  const binary = atob(text);
+  const out = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+  return out;
+}
+
+function concatBytes(...parts) {
+  const total = parts.reduce((n, p) => n + p.length, 0);
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const part of parts) { out.set(part, at); at += part.length; }
+  return out;
+}
+
+/**
+ * Encrypt `payload` so that only the holder of the matching private key can
+ * read it. Returns the envelope JSON string.
+ *
+ * Ephemeral ECDH: a fresh keypair per submission, so two people submitting
+ * the same credential produce unrelated ciphertexts and nothing links them.
+ */
+async function sealToPublicKey(payload, serverPublicB64) {
+  const serverRaw = b64decode(serverPublicB64);
+
+  const serverKey = await crypto.subtle.importKey(
+    "raw", serverRaw, { name: "ECDH", namedCurve: "P-256" }, false, []);
+
+  const ephemeral = await crypto.subtle.generateKey(
+    { name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]);
+
+  const ephemeralRaw = new Uint8Array(
+    await crypto.subtle.exportKey("raw", ephemeral.publicKey));
+
+  const shared = new Uint8Array(await crypto.subtle.deriveBits(
+    { name: "ECDH", public: serverKey }, ephemeral.privateKey, 256));
+
+  // info binds the derived key to this recipient and this ephemeral key.
+  // Byte-for-byte identical to signup_crypto._derive_key.
+  const info = concatBytes(
+    new TextEncoder().encode(CONTEXT), serverRaw, ephemeralRaw);
+
+  const hkdfKey = await crypto.subtle.importKey(
+    "raw", shared, "HKDF", false, ["deriveBits"]);
+
+  // An EMPTY salt, matching cryptography's salt=None. RFC 5869 says an
+  // absent salt means HashLen zero bytes, and HMAC pads any key shorter than
+  // its block size with zeros - so empty and 32 zero bytes derive the same
+  // key. The Node test asserts that rather than trusting the reasoning.
+  const keyBits = await crypto.subtle.deriveBits(
+    { name: "HKDF", hash: "SHA-256", salt: new Uint8Array(0), info },
+    hkdfKey, 256);
+
+  const aesKey = await crypto.subtle.importKey(
+    "raw", keyBits, { name: "AES-GCM" }, false, ["encrypt"]);
+
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ciphertext = new Uint8Array(await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv },
+    aesKey,
+    new TextEncoder().encode(JSON.stringify(payload))));
+
+  return JSON.stringify({
+    v: ENVELOPE_VERSION,
+    epk: b64encode(ephemeralRaw),
+    iv: b64encode(iv),
+    ct: b64encode(ciphertext),
+  });
+}
+
+/**
+ * Client-side credential checks.
+ *
+ * These are a COURTESY, not a control: anyone can POST to the endpoint
+ * directly. The real enforcement is verify_credential() in the venue
+ * adapters, which asks the exchange itself what the key can do. This only
+ * spares an honest participant a rejection they would otherwise learn about
+ * by email hours later.
+ */
+function localCredentialProblem(fields) {
+  if (fields.exchange === "lighter") {
+    if (!fields.api_key.startsWith("ro:")) {
+      return "Lighter credentials must be a read-only token starting with " +
+             "\"ro:\". A wallet private key cannot be revoked and will be " +
+             "rejected.";
+    }
+    if (fields.account_type !== "perp") {
+      return "Lighter has no spot market - choose Perpetuals.";
+    }
+  }
+  if (fields.exchange === "coinbase" && !fields.api_secret) {
+    return "Coinbase needs both an API key and an API secret.";
+  }
+  return null;
+}
+// ===== END PORTABLE CRYPTO =======================================================
+
+
+// ---------------------------------------------------------------------------
+// Page wiring
+// ---------------------------------------------------------------------------
+
+const CONFIG = {
+  // Your Supabase project URL, e.g. https://abcdefgh.supabase.co
+  SUPABASE_URL: "REPLACE_WITH_SUPABASE_URL",
+
+  // The ANON key, not the service_role key. It is meant to be public: RLS on
+  // pending_signups grants anon INSERT and nothing else, so this key can add
+  // a row and can neither read one back nor reach any other table.
+  SUPABASE_ANON_KEY: "REPLACE_WITH_SUPABASE_ANON_KEY",
+
+  // From `python signup_crypto.py --public`. Public by design.
+  SIGNUP_PUBLIC_KEY: "REPLACE_WITH_SIGNUP_PUBLIC_KEY",
+};
+
+const form = document.getElementById("signup");
+const statusBox = document.getElementById("status");
+const submitButton = document.getElementById("submit");
+const exchangeSelect = document.getElementById("exchange");
+const accountType = document.getElementById("account_type");
+
+// WebCrypto is unavailable on insecure origins, so say so instead of failing
+// with a confusing error after someone has typed a real credential in.
+if (!window.isSecureContext || !crypto.subtle) {
+  document.getElementById("insecure").hidden = false;
+  submitButton.disabled = true;
+}
+
+function say(kind, html) {
+  statusBox.innerHTML = `<div class="note ${kind}">${html}</div>`;
+}
+
+/** Lighter takes a single token and has no spot market; Coinbase takes a pair. */
+function applyVenueRules() {
+  const lighter = exchangeSelect.value === "lighter";
+
+  document.getElementById("secret-field").hidden = lighter;
+  document.getElementById("passphrase-field").hidden = lighter;
+  document.getElementById("api_secret").required = !lighter;
+
+  document.getElementById("key-label").textContent =
+    lighter ? "Read-only token" : "API key";
+  document.getElementById("key-hint").textContent =
+    lighter ? "Starts with \"ro:\". Not your wallet private key."
+            : "The key's public identifier.";
+
+  accountType.value = lighter ? "perp" : accountType.value;
+  accountType.disabled = lighter;
+  document.getElementById("account-type-field").hidden = lighter;
+}
+
+exchangeSelect.addEventListener("change", applyVenueRules);
+applyVenueRules();
+
+form.addEventListener("submit", async (event) => {
+  event.preventDefault();
+
+  if (CONFIG.SIGNUP_PUBLIC_KEY.startsWith("REPLACE_WITH_")) {
+    say("bad", "This form has not been configured yet. The organiser needs to " +
+               "fill in CONFIG before it can accept submissions.");
+    return;
+  }
+
+  const data = Object.fromEntries(new FormData(form).entries());
+  const fields = {
+    display_name: (data.display_name || "").trim(),
+    email: (data.email || "").trim(),
+    exchange: data.exchange,
+    account_type: exchangeSelect.value === "lighter" ? "perp" : data.account_type,
+    api_key: (data.api_key || "").trim(),
+    api_secret: (data.api_secret || "").trim(),
+    api_passphrase: (data.api_passphrase || "").trim(),
+  };
+
+  const problem = localCredentialProblem(fields);
+  if (problem) { say("bad", problem); return; }
+
+  submitButton.disabled = true;
+  say("ok", "Encrypting…");
+
+  try {
+    // Only the secret half is sealed. Name, email and venue stay readable so
+    // the organiser can tell who submitted what, and contact you if the
+    // credential turns out not to work - none of which needs the key itself.
+    const envelope = await sealToPublicKey({
+      api_key: fields.api_key,
+      api_secret: fields.api_secret || null,
+      api_passphrase: fields.api_passphrase || null,
+      exchange: fields.exchange,
+      account_type: fields.account_type,
+    }, CONFIG.SIGNUP_PUBLIC_KEY);
+
+    const response = await fetch(
+      `${CONFIG.SUPABASE_URL}/rest/v1/pending_signups`, {
+        method: "POST",
+        headers: {
+          "apikey": CONFIG.SUPABASE_ANON_KEY,
+          "Authorization": `Bearer ${CONFIG.SUPABASE_ANON_KEY}`,
+          "Content-Type": "application/json",
+          "Prefer": "return=minimal",
+        },
+        body: JSON.stringify({
+          display_name: fields.display_name,
+          email: fields.email,
+          exchange: fields.exchange,
+          account_type: fields.account_type,
+          ciphertext: envelope,
+        }),
+      });
+
+    if (!response.ok) {
+      throw new Error(`${response.status} ${await response.text()}`);
+    }
+
+    form.hidden = true;
+    say("ok", "<strong>Submitted.</strong> Your credentials were encrypted " +
+              "before they left this page. They will be checked against the " +
+              "exchange shortly; if the key turns out not to be read-only, " +
+              "you will be emailed and can submit a replacement.");
+
+  } catch (error) {
+    submitButton.disabled = false;
+    say("bad", `Could not submit: ${error.message}. Nothing was sent. ` +
+               `Please try again, or contact the organiser.`);
+  }
+});
+</script>
+</body>
+</html>
