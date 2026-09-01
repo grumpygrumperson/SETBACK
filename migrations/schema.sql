@@ -10,7 +10,7 @@
 -- halfway through cannot leave the database half-migrated. Re-running it is
 -- always safe.
 --
--- Seven tables and two views:
+-- Eight tables and three views:
 --   participants          one row per person
 --   participant_api_keys  one row per venue (spot and perps use DIFFERENT keys)
 --   trade_metrics         closed orders, tagged by venue
@@ -18,7 +18,9 @@
 --   cash_flows            external deposits/withdrawals, so returns mean something
 --   fetch_errors          per-credential sync failures
 --   participant_scores    flow-adjusted Sharpe, what the ranking uses
+--   pending_signups       the signup form inbox, ciphertext only
 --   latest_balances       view: current equity, by venue
+--   daily_balances        view: last snapshot per venue per day, for scoring
 --   leaderboard           view: the ranking
 -- ============================================================================
 
@@ -661,7 +663,95 @@ alter table public.participant_scores
 
 
 -- ---------------------------------------------------------------------------
--- 8. Indexes
+-- 8. Pending signups — the signup form inbox
+--
+-- A signup form that writes credentials straight to Postgres puts PLAINTEXT
+-- exchange keys in a table, and in every backup of that table, until an
+-- operator runs the importer. That defeats the entire point of the Fernet
+-- layer, which exists so that reading the database is not the same as
+-- holding the keys.
+--
+-- So the browser encrypts before it submits, and this table holds only the
+-- envelope: ephemeral ECDH over P-256, HKDF-SHA256, AES-256-GCM, openable
+-- solely with SIGNUP_PRIVATE_KEY. That key lives on the importer machine and
+-- is never deployed to Railway - the sync service never touches this table,
+-- and a key it does not hold is a key it cannot leak. See signup_crypto.py.
+--
+-- `ciphertext` is NULLABLE because it is cleared the moment a row resolves.
+-- An imported submission has had its credential re-encrypted under
+-- FERNET_KEY in participant_api_keys; a rejected one holds a credential
+-- nobody will ever use. Retaining either is keeping a secret with no
+-- remaining purpose. The row stays for the audit trail; the payload does not.
+--
+-- display_name, email, exchange and account_type are stored in the clear so
+-- an operator can see who submitted what without decrypting anything, and
+-- contact someone whose key failed verification. None of it is secret - the
+-- same columns sit in the clear on `participants`. They are ADVISORY: the
+-- importer uses the authenticated copy inside the envelope, so a mismatched
+-- plaintext column cannot redirect a credential to a venue it was not
+-- encrypted for.
+-- ---------------------------------------------------------------------------
+
+create table if not exists public.pending_signups (
+  id            bigint generated always as identity primary key,
+  display_name  text not null,
+  email         text not null,
+  exchange      text not null,
+  account_type  text not null,
+  ciphertext    text,                    -- sealed envelope; null once resolved
+  status        text not null default 'pending',
+  attempts      integer not null default 0,
+  last_error    text,
+  submitted_at  timestamptz not null default now(),
+  processed_at  timestamptz
+);
+
+-- Restated outside the CREATE for the usual reason: the column list above is
+-- a no-op on a table that already exists, so anything added later has to
+-- appear here too or a database built from an earlier revision never gets it.
+alter table public.pending_signups add column if not exists attempts integer not null default 0;
+alter table public.pending_signups add column if not exists last_error text;
+alter table public.pending_signups add column if not exists processed_at timestamptz;
+
+-- anon can INSERT into this table, which makes every constraint below a limit
+-- on what an anonymous caller can store. The size bounds are the point:
+-- without them one request could park an arbitrary amount of data here.
+--
+-- They are not a defence against VOLUME. Nothing in Postgres stops the same
+-- caller submitting repeatedly - that belongs at the edge, in Supabase rate
+-- limiting or a captcha in front of the form, and is worth adding before the
+-- form is advertised anywhere public.
+alter table public.pending_signups drop constraint if exists pending_signups_status_check;
+alter table public.pending_signups add constraint pending_signups_status_check
+  check (status in ('pending', 'imported', 'rejected'));
+
+alter table public.pending_signups drop constraint if exists pending_signups_exchange_check;
+alter table public.pending_signups add constraint pending_signups_exchange_check
+  check (exchange in ('coinbase', 'lighter'));
+
+alter table public.pending_signups drop constraint if exists pending_signups_account_type_check;
+alter table public.pending_signups add constraint pending_signups_account_type_check
+  check (account_type in ('spot', 'perp'));
+
+alter table public.pending_signups drop constraint if exists pending_signups_size_check;
+alter table public.pending_signups add constraint pending_signups_size_check
+  check (
+    length(display_name) between 1 and 40
+    and length(email) between 3 and 320
+    and (ciphertext is null or length(ciphertext) <= 8000)
+  );
+
+-- A resolved row keeps no payload. Enforced in the database rather than left
+-- to the importer, because this is the property the whole design rests on and
+-- a bug in Python should not be able to leave a live credential sitting in a
+-- table anon can write to.
+alter table public.pending_signups drop constraint if exists pending_signups_resolved_is_empty;
+alter table public.pending_signups add constraint pending_signups_resolved_is_empty
+  check (status = 'pending' or ciphertext is null);
+
+
+-- ---------------------------------------------------------------------------
+-- 9. Indexes
 --
 -- Two distinct access patterns, and an index that serves one will not serve
 -- the other:
@@ -686,6 +776,11 @@ create index if not exists trade_metrics_participant_venue_time_idx
 drop index if exists balance_snapshots_participant_time_idx;
 create index if not exists balance_snapshots_participant_venue_time_idx
   on public.balance_snapshots (participant_id, exchange, account_type, timestamp desc);
+
+-- The importer only ever asks for unresolved rows, while resolved ones
+-- accumulate for the audit trail - so the useful index is the partial one.
+create index if not exists pending_signups_pending_idx
+  on public.pending_signups (id) where status = 'pending';
 
 -- The sync now reads every active credential in ONE request rather than one
 -- per participant, ordered so that the same credential collects a
@@ -726,7 +821,7 @@ create index if not exists balance_snapshots_participant_time_id_idx
 
 
 -- ---------------------------------------------------------------------------
--- 9. Leaderboard views
+-- 10. Leaderboard views
 --
 -- TWO views, and the distinction matters:
 --
@@ -867,7 +962,7 @@ left join public.latest_balances b
 
 
 -- ---------------------------------------------------------------------------
--- 10. Row Level Security
+-- 11. Row Level Security
 --
 -- The sync uses the SERVICE ROLE key, which bypasses RLS entirely. These
 -- policies only constrain what the anon key can reach.
@@ -884,6 +979,28 @@ alter table public.balance_snapshots    enable row level security;
 alter table public.fetch_errors         enable row level security;
 alter table public.cash_flows           enable row level security;
 alter table public.participant_scores   enable row level security;
+alter table public.pending_signups      enable row level security;
+
+-- The ONE place anon is allowed to write.
+--
+-- Insert and nothing else: there is deliberately no select policy, so a
+-- submitter cannot read back their own row, cannot read anyone else's, and
+-- cannot use the endpoint to test whether an email is already registered.
+--
+-- The grant is stated explicitly rather than relying on whatever Supabase
+-- has granted on the public schema, and the other verbs are revoked, because
+-- "anon can only insert" is the property this entire table depends on.
+drop policy if exists "anon submits a signup" on public.pending_signups;
+create policy "anon submits a signup"
+  on public.pending_signups
+  for insert
+  to anon
+  with check (true);
+
+grant insert on public.pending_signups to anon;
+revoke select, update, delete on public.pending_signups from anon;
+revoke all on public.pending_signups from authenticated;
+
 
 drop policy if exists "participants read own trades"    on public.trade_metrics;
 drop policy if exists "participants read own snapshots" on public.balance_snapshots;
@@ -903,7 +1020,7 @@ create policy "leaderboard is readable"
 
 
 -- ---------------------------------------------------------------------------
--- 11. View access
+-- 12. View access
 --
 -- IMPORTANT: views do NOT inherit RLS. By default a view runs with its
 -- owner's privileges, so latest_balances bypasses every policy above — which
@@ -933,7 +1050,7 @@ revoke all on public.daily_balances from authenticated;
 
 
 -- ---------------------------------------------------------------------------
--- 12. Confirmation
+-- 13. Confirmation
 --
 -- The SQL editor shows the result of the LAST statement, so this is what you
 -- see after pressing Run. Without it a successful migration looks identical
