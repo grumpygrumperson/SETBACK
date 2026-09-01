@@ -45,7 +45,7 @@ Three properties the design turns on:
 ```bash
 uv sync --dev                 # install, including test dependencies
 cp .env.example .env          # then fill in SUPABASE_URL, SUPABASE_KEY, FERNET_KEY
-uv run pytest -q              # 318 tests, no network needed
+uv run pytest -q              # 301 tests, no network needed
 ```
 
 Apply the schema by pasting **`migrations/schema.sql`** into the Supabase SQL
@@ -88,7 +88,7 @@ already put there.
 | `cash_flows` | Deposits and withdrawals, so returns mean something |
 | `fetch_errors` | Per-credential sync failures |
 | `participant_scores` | Current Sharpe per participant, upserted each run |
-| `pending_signups` | The signup form's inbox — ciphertext only |
+| `pending_signups` | The signup form inbox — plaintext, wiped on import |
 | `latest_balances` | *view* — current equity by venue |
 | `daily_balances` | *view* — last snapshot per venue per day; what scoring reads |
 | `leaderboard` | *view* — the ranking |
@@ -105,10 +105,8 @@ entries sort below established ones rather than disappearing.
 uv run python post_to_supabase.py     # the hourly job: sync, then score
 uv run python score.py                # rescore from stored history, no fetching
 uv run python score.py --period daily
-uv run python sign_ups.py             # import pending signups from the form
+uv run python sign_ups.py             # drain pending signups from the form
 uv run python sign_ups.py --csv       # legacy: import participant_signups.csv
-uv run python signup_crypto.py --generate   # a new signup keypair
-uv run python signup_crypto.py --public     # the public key, for the form
 uv run python metrics.py              # print Sharpe for everyone
 uv run python rotate_credentials.py --audit   # report credential SHAPES only
 uv run python coinbase.py             # sanity-check the adapter against your own keys
@@ -126,43 +124,49 @@ data.
 
 ## Participant signup
 
-Participants submit through a static form that **encrypts their credentials in
-the browser**. The database only ever holds ciphertext.
+Participants submit through a static form that POSTs to `pending_signups`.
+The importer verifies each key against the exchange, encrypts it under
+`FERNET_KEY`, and wipes the plaintext.
 
 ```
-browser        ephemeral ECDH (P-256) → HKDF-SHA256 → AES-256-GCM
-               against SIGNUP_PUBLIC_KEY, using built-in WebCrypto
-      ↓
-pending_signups   {"v":1,"epk":…,"iv":…,"ct":…}   anon may INSERT, nothing else
-      ↓
-sign_ups.py    decrypt → verify read-only against the exchange
-               → re-encrypt under FERNET_KEY → participant_api_keys
-               → clear the payload
+form  →  pending_signups        anon may INSERT, and nothing else
+      →  sign_ups.py            verify read-only against the exchange
+                                → Fernet-encrypt → participant_api_keys
+                                → wipe the plaintext row
 ```
-
-The point is that a form writing straight to Supabase would put plaintext
-exchange keys in a table — and in every backup of it — until someone ran the
-importer, which defeats the entire Fernet layer.
 
 **Setting it up**
 
-1. `uv run python signup_crypto.py --generate`
-2. Put the private half in `.env` as `SIGNUP_PRIVATE_KEY` on the machine that
-   runs the importer. **Not on Railway** — the sync never reads
-   `pending_signups`, and a key it doesn't hold is a key it can't leak.
-3. Fill in the three values in `CONFIG` at the bottom of
-   [`signup_form.html`](signup_form.html): your Supabase URL, your **anon**
-   key, and the public half from step 1.
-4. Host the file anywhere static, **over HTTPS** — WebCrypto is unavailable on
-   insecure origins, and the form disables itself and says so rather than
-   falling back to sending plaintext.
-5. Run `uv run python sign_ups.py` to drain the inbox.
+1. Fill in the two values in `CONFIG` at the bottom of
+   [`signup_form.html`](signup_form.html): your Supabase URL and your **anon**
+   key. Neither is secret — the anon key is public by design, and RLS is what
+   constrains it.
+2. Host the file anywhere static, over **HTTPS**. It can be embedded in a
+   Figma site, served from a Supabase Storage bucket, GitHub Pages, or
+   Netlify. Serve it over HTTPS because it asks people to type API keys.
+3. Run `uv run python sign_ups.py` to drain the inbox.
+
+**Drain it often.** Credentials sit in `pending_signups` **in plaintext**
+between submission and import — anyone who can read that table, and every
+Supabase backup taken while a row is pending, holds usable credentials. That
+window is the whole exposure and it is under your control.
+
+The trade is deliberate and rests on two things. Every credential here is
+read-only, so a leak exposes positions rather than funds; and the rows clear
+on import. If either stops being true — a credential that can move money, or a
+table left undrained for weeks — this design needs revisiting. The alternative
+is a Supabase Edge Function holding `FERNET_KEY` and encrypting at insert, so
+plaintext never lands at all.
+
+**Why not encrypt in the browser?** Fernet is symmetric. The page would need
+`FERNET_KEY` itself, and shipping that to every visitor would expose the key
+protecting every credential already stored.
 
 **What the anon key can do.** Insert one row into `pending_signups`. It has no
 `select` policy, so a submitter can't read their row back, can't read anyone
 else's, and can't use the endpoint to probe whether an email is registered.
 Verified against real PostgreSQL, along with a check constraint that refuses
-to let a resolved row keep its payload — so the credential is destroyed on
+to let a resolved row keep a credential — so the plaintext is destroyed on
 import even if the importer has a bug.
 
 **What it doesn't do.** Nothing rate-limits submissions. Sizes are bounded, but
@@ -172,7 +176,7 @@ before advertising it publicly.
 Verification is asynchronous, so someone who submits a trade-capable key finds
 out later. The reason is stored in `pending_signups.last_error`, and transient
 failures are retried up to `MAX_IMPORT_ATTEMPTS` before the row is rejected and
-its payload destroyed.
+its credential wiped.
 
 ---
 

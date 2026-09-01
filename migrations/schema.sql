@@ -18,7 +18,7 @@
 --   cash_flows            external deposits/withdrawals, so returns mean something
 --   fetch_errors          per-credential sync failures
 --   participant_scores    flow-adjusted Sharpe, what the ranking uses
---   pending_signups       the signup form inbox, ciphertext only
+--   pending_signups       the signup form inbox, drained by sign_ups.py
 --   latest_balances       view: current equity, by venue
 --   daily_balances        view: last snapshot per venue per day, for scoring
 --   leaderboard           view: the ranking
@@ -665,53 +665,75 @@ alter table public.participant_scores
 -- ---------------------------------------------------------------------------
 -- 8. Pending signups — the signup form inbox
 --
--- A signup form that writes credentials straight to Postgres puts PLAINTEXT
--- exchange keys in a table, and in every backup of that table, until an
--- operator runs the importer. That defeats the entire point of the Fernet
--- layer, which exists so that reading the database is not the same as
--- holding the keys.
+-- The form POSTs here; sign_ups.py verifies each credential against the
+-- exchange, re-encrypts it under FERNET_KEY into participant_api_keys, and
+-- wipes the plaintext from this row.
 --
--- So the browser encrypts before it submits, and this table holds only the
--- envelope: ephemeral ECDH over P-256, HKDF-SHA256, AES-256-GCM, openable
--- solely with SIGNUP_PRIVATE_KEY. That key lives on the importer machine and
--- is never deployed to Railway - the sync service never touches this table,
--- and a key it does not hold is a key it cannot leak. See signup_crypto.py.
+-- READ THIS BEFORE CHANGING ANYTHING HERE.
 --
--- `ciphertext` is NULLABLE because it is cleared the moment a row resolves.
--- An imported submission has had its credential re-encrypted under
--- FERNET_KEY in participant_api_keys; a rejected one holds a credential
--- nobody will ever use. Retaining either is keeping a secret with no
--- remaining purpose. The row stays for the audit trail; the payload does not.
+-- Credentials sit in this table IN PLAINTEXT between submission and import.
+-- That is a deliberate trade, not an oversight, and it has a cost worth
+-- stating plainly: anyone who can read this table, and every Supabase backup
+-- taken while a row is pending, holds usable exchange credentials.
 --
--- display_name, email, exchange and account_type are stored in the clear so
--- an operator can see who submitted what without decrypting anything, and
--- contact someone whose key failed verification. None of it is secret - the
--- same columns sit in the clear on `participants`. They are ADVISORY: the
--- importer uses the authenticated copy inside the envelope, so a mismatched
--- plaintext column cannot redirect a credential to a venue it was not
--- encrypted for.
+-- The trade is defensible for two specific reasons, and stops being
+-- defensible if either changes:
+--
+--   1. Every credential here is READ-ONLY - verify_credential rejects
+--      anything that can trade or transfer. A leak exposes positions, not
+--      funds. If this table is ever used for a credential that can move
+--      money, this design is wrong.
+--
+--   2. The window is short and under the operator's control. Rows are
+--      cleared on import, so running sign_ups.py often keeps the table
+--      empty. A table left undrained for weeks is the failure mode.
+--
+-- The alternative - encrypting in the browser so this table never holds
+-- plaintext - cannot be done with Fernet. Fernet is symmetric, so the page
+-- would need FERNET_KEY, and shipping that to every visitor would expose the
+-- key protecting every already-stored credential. Public-key encryption in
+-- the browser does solve it, and a Supabase Edge Function holding FERNET_KEY
+-- solves it too; both were judged more machinery than this is worth.
+--
+-- The credential columns are NULLABLE because they are wiped the moment a row
+-- resolves. An imported one now lives Fernet-encrypted in
+-- participant_api_keys; a rejected one is a credential nobody will use. The
+-- row stays for the audit trail; the secret does not.
 -- ---------------------------------------------------------------------------
 
 create table if not exists public.pending_signups (
-  id            bigint generated always as identity primary key,
-  display_name  text not null,
-  email         text not null,
-  exchange      text not null,
-  account_type  text not null,
-  ciphertext    text,                    -- sealed envelope; null once resolved
-  status        text not null default 'pending',
-  attempts      integer not null default 0,
-  last_error    text,
-  submitted_at  timestamptz not null default now(),
-  processed_at  timestamptz
+  id             bigint generated always as identity primary key,
+  display_name   text not null,
+  email          text not null,
+  exchange       text not null,
+  account_type   text not null,
+
+  -- Plaintext, and only until the importer runs. See the warning above.
+  api_key        text,
+  api_secret     text,                    -- null on single-credential venues
+  api_passphrase text,
+
+  status         text not null default 'pending',
+  attempts       integer not null default 0,
+  last_error     text,
+  submitted_at   timestamptz not null default now(),
+  processed_at   timestamptz
 );
 
 -- Restated outside the CREATE for the usual reason: the column list above is
 -- a no-op on a table that already exists, so anything added later has to
 -- appear here too or a database built from an earlier revision never gets it.
+alter table public.pending_signups add column if not exists api_key text;
+alter table public.pending_signups add column if not exists api_secret text;
+alter table public.pending_signups add column if not exists api_passphrase text;
 alter table public.pending_signups add column if not exists attempts integer not null default 0;
 alter table public.pending_signups add column if not exists last_error text;
 alter table public.pending_signups add column if not exists processed_at timestamptz;
+
+-- An earlier revision of this file stored a sealed envelope here instead of
+-- plaintext columns. Dropped rather than left in place: a column nothing
+-- writes and nothing reads is one somebody eventually assumes is meaningful.
+alter table public.pending_signups drop column if exists ciphertext;
 
 -- anon can INSERT into this table, which makes every constraint below a limit
 -- on what an anonymous caller can store. The size bounds are the point:
@@ -733,21 +755,29 @@ alter table public.pending_signups drop constraint if exists pending_signups_acc
 alter table public.pending_signups add constraint pending_signups_account_type_check
   check (account_type in ('spot', 'perp'));
 
+-- Generous but finite. A Coinbase CDP secret is a PEM-encoded EC private key
+-- of a few hundred characters, which is the longest thing legitimately
+-- submitted here.
 alter table public.pending_signups drop constraint if exists pending_signups_size_check;
 alter table public.pending_signups add constraint pending_signups_size_check
   check (
     length(display_name) between 1 and 40
     and length(email) between 3 and 320
-    and (ciphertext is null or length(ciphertext) <= 8000)
+    and (api_key is null or length(api_key) <= 2000)
+    and (api_secret is null or length(api_secret) <= 4000)
+    and (api_passphrase is null or length(api_passphrase) <= 500)
   );
 
--- A resolved row keeps no payload. Enforced in the database rather than left
--- to the importer, because this is the property the whole design rests on and
--- a bug in Python should not be able to leave a live credential sitting in a
--- table anon can write to.
+-- A resolved row keeps no credential. Enforced in the database rather than
+-- left to the importer, because this is the property that bounds how long
+-- plaintext lives here - and a bug in Python should not be able to leave a
+-- usable credential sitting in a table anon can write to.
 alter table public.pending_signups drop constraint if exists pending_signups_resolved_is_empty;
 alter table public.pending_signups add constraint pending_signups_resolved_is_empty
-  check (status = 'pending' or ciphertext is null);
+  check (
+    status = 'pending'
+    or (api_key is null and api_secret is null and api_passphrase is null)
+  );
 
 
 -- ---------------------------------------------------------------------------

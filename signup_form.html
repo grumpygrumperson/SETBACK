@@ -8,18 +8,21 @@
 <!--
   Participant signup form.
 
-  Credentials are encrypted IN THE BROWSER before they are submitted. The
-  database receives ciphertext only; nothing here can be decrypted without
-  SIGNUP_PRIVATE_KEY, which lives on the importer machine and is never
-  deployed. See signup_crypto.py.
+  Submits to pending_signups, which anon may INSERT into and cannot read.
+  sign_ups.py then verifies each credential against the exchange, re-encrypts
+  it under FERNET_KEY into participant_api_keys, and wipes the plaintext row.
 
-  HOSTING: any static host. A Supabase Storage public bucket, GitHub Pages,
-  Netlify - it makes no difference, because the page talks to Supabase's REST
-  API directly and holds no secret. Serve it over HTTPS: WebCrypto is
-  unavailable on plain http:// origins other than localhost, and the form
-  will tell the visitor so rather than silently sending plaintext.
+  Credentials are in PLAINTEXT in that table until the importer runs. Run
+  sign_ups.py often; the window is the whole exposure. See the warning at the
+  top of section 8 in migrations/schema.sql.
 
-  CONFIGURE the three values in CONFIG below before deploying.
+  HOSTING: any static host, over HTTPS. The page holds no secret - the anon
+  key is public by design and RLS is what constrains it - so it can be served
+  from a Supabase Storage bucket, GitHub Pages, Netlify, or embedded in a
+  Figma site. Serve it over HTTPS anyway: this form asks people to type
+  exchange credentials, and doing that over http:// sends them in the clear.
+
+  CONFIGURE the two values in CONFIG below before deploying.
 -->
 
 <style>
@@ -108,8 +111,8 @@
 </div>
 
 <div id="insecure" class="note bad" hidden>
-  This page is not being served over HTTPS, so your browser will not provide
-  the encryption this form depends on. Do not enter credentials here.
+  This page is not being served over HTTPS, so anything you type here would be
+  sent unencrypted. Do not enter credentials.
 </div>
 
 <form id="signup" autocomplete="off">
@@ -150,128 +153,58 @@
     <label>
       <span class="lbl" id="key-label">API key</span>
       <span class="hint" id="key-hint">The key's public identifier.</span>
-      <input name="api_key" id="api_key" class="mono" required>
+      <input name="api_key" id="api_key" class="mono" required maxlength="2000">
     </label>
     <label id="secret-field">
       <span class="lbl">API secret</span>
-      <input name="api_secret" id="api_secret" type="password" class="mono">
+      <input name="api_secret" id="api_secret" type="password" class="mono" maxlength="4000">
     </label>
     <label id="passphrase-field">
       <span class="lbl">Passphrase <span class="hint" style="display:inline">— if your key has one</span></span>
-      <input name="api_passphrase" type="password" class="mono">
+      <input name="api_passphrase" type="password" class="mono" maxlength="500">
     </label>
   </fieldset>
 
-  <button type="submit" id="submit">Encrypt and submit</button>
+  <button type="submit" id="submit">Submit</button>
 </form>
 
 <div id="status"></div>
 
 <footer>
-  Your credentials are encrypted in this browser before they are sent. The
-  database stores ciphertext only.
+  Your credentials are checked against the exchange and stored encrypted. Only
+  read-only keys are accepted.
 </footer>
 
 </main>
 
 <script>
-// ===== BEGIN PORTABLE CRYPTO =====================================================
-// Everything between these markers is extracted verbatim and executed under
-// Node by tests/test_signup_crypto.py, which then decrypts the result with
-// signup_crypto.py. That test is the only thing that can catch the two
-// implementations drifting apart - a mismatch here does not fail loudly, it
-// produces submissions nobody can ever open.
-//
-// Keep it free of DOM references so it stays runnable outside a browser.
+// ===== BEGIN PORTABLE LOGIC ======================================================
+// Extracted and run under Node by tests/test_signup_form.py. Keep it free of
+// DOM references so it stays runnable outside a browser.
 
-const CONTEXT = "SETAPI-signup-v1";     // must equal signup_crypto.CONTEXT
-const ENVELOPE_VERSION = 1;
-
-function b64encode(bytes) {
-  const arr = new Uint8Array(bytes);
-  let binary = "";
-  for (let i = 0; i < arr.length; i++) binary += String.fromCharCode(arr[i]);
-  return btoa(binary);
-}
-
-function b64decode(text) {
-  const binary = atob(text);
-  const out = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
-  return out;
-}
-
-function concatBytes(...parts) {
-  const total = parts.reduce((n, p) => n + p.length, 0);
-  const out = new Uint8Array(total);
-  let at = 0;
-  for (const part of parts) { out.set(part, at); at += part.length; }
-  return out;
-}
-
-/**
- * Encrypt `payload` so that only the holder of the matching private key can
- * read it. Returns the envelope JSON string.
- *
- * Ephemeral ECDH: a fresh keypair per submission, so two people submitting
- * the same credential produce unrelated ciphertexts and nothing links them.
- */
-async function sealToPublicKey(payload, serverPublicB64) {
-  const serverRaw = b64decode(serverPublicB64);
-
-  const serverKey = await crypto.subtle.importKey(
-    "raw", serverRaw, { name: "ECDH", namedCurve: "P-256" }, false, []);
-
-  const ephemeral = await crypto.subtle.generateKey(
-    { name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]);
-
-  const ephemeralRaw = new Uint8Array(
-    await crypto.subtle.exportKey("raw", ephemeral.publicKey));
-
-  const shared = new Uint8Array(await crypto.subtle.deriveBits(
-    { name: "ECDH", public: serverKey }, ephemeral.privateKey, 256));
-
-  // info binds the derived key to this recipient and this ephemeral key.
-  // Byte-for-byte identical to signup_crypto._derive_key.
-  const info = concatBytes(
-    new TextEncoder().encode(CONTEXT), serverRaw, ephemeralRaw);
-
-  const hkdfKey = await crypto.subtle.importKey(
-    "raw", shared, "HKDF", false, ["deriveBits"]);
-
-  // An EMPTY salt, matching cryptography's salt=None. RFC 5869 says an
-  // absent salt means HashLen zero bytes, and HMAC pads any key shorter than
-  // its block size with zeros - so empty and 32 zero bytes derive the same
-  // key. The Node test asserts that rather than trusting the reasoning.
-  const keyBits = await crypto.subtle.deriveBits(
-    { name: "HKDF", hash: "SHA-256", salt: new Uint8Array(0), info },
-    hkdfKey, 256);
-
-  const aesKey = await crypto.subtle.importKey(
-    "raw", keyBits, { name: "AES-GCM" }, false, ["encrypt"]);
-
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const ciphertext = new Uint8Array(await crypto.subtle.encrypt(
-    { name: "AES-GCM", iv },
-    aesKey,
-    new TextEncoder().encode(JSON.stringify(payload))));
-
-  return JSON.stringify({
-    v: ENVELOPE_VERSION,
-    epk: b64encode(ephemeralRaw),
-    iv: b64encode(iv),
-    ct: b64encode(ciphertext),
-  });
-}
+// The exact keys POSTed to pending_signups. They must match the column names
+// in migrations/schema.sql and what sign_ups.py reads, and the test asserts
+// all three agree - a typo here would arrive as a null credential and be
+// reported as an invalid key rather than as the spelling mistake it is.
+const SUBMIT_FIELDS = [
+  "display_name",
+  "email",
+  "exchange",
+  "account_type",
+  "api_key",
+  "api_secret",
+  "api_passphrase",
+];
 
 /**
  * Client-side credential checks.
  *
- * These are a COURTESY, not a control: anyone can POST to the endpoint
- * directly. The real enforcement is verify_credential() in the venue
- * adapters, which asks the exchange itself what the key can do. This only
- * spares an honest participant a rejection they would otherwise learn about
- * by email hours later.
+ * A COURTESY, not a control: anyone can POST to the endpoint directly. The
+ * real enforcement is verify_credential() in the venue adapters, which asks
+ * the exchange itself what the key can do. This only spares an honest
+ * participant a rejection they would otherwise learn about by email hours
+ * later - and, for the Lighter case, stops a wallet private key being
+ * transmitted at all.
  */
 function localCredentialProblem(fields) {
   if (fields.exchange === "lighter") {
@@ -289,7 +222,7 @@ function localCredentialProblem(fields) {
   }
   return null;
 }
-// ===== END PORTABLE CRYPTO =======================================================
+// ===== END PORTABLE LOGIC ========================================================
 
 
 // ---------------------------------------------------------------------------
@@ -304,9 +237,6 @@ const CONFIG = {
   // pending_signups grants anon INSERT and nothing else, so this key can add
   // a row and can neither read one back nor reach any other table.
   SUPABASE_ANON_KEY: "REPLACE_WITH_SUPABASE_ANON_KEY",
-
-  // From `python signup_crypto.py --public`. Public by design.
-  SIGNUP_PUBLIC_KEY: "REPLACE_WITH_SIGNUP_PUBLIC_KEY",
 };
 
 const form = document.getElementById("signup");
@@ -315,9 +245,8 @@ const submitButton = document.getElementById("submit");
 const exchangeSelect = document.getElementById("exchange");
 const accountType = document.getElementById("account_type");
 
-// WebCrypto is unavailable on insecure origins, so say so instead of failing
-// with a confusing error after someone has typed a real credential in.
-if (!window.isSecureContext || !crypto.subtle) {
+// Typing an API key into a page served over http:// sends it in the clear.
+if (!window.isSecureContext) {
   document.getElementById("insecure").hidden = false;
   submitButton.disabled = true;
 }
@@ -351,7 +280,7 @@ applyVenueRules();
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
 
-  if (CONFIG.SIGNUP_PUBLIC_KEY.startsWith("REPLACE_WITH_")) {
+  if (CONFIG.SUPABASE_URL.startsWith("REPLACE_WITH_")) {
     say("bad", "This form has not been configured yet. The organiser needs to " +
                "fill in CONFIG before it can accept submissions.");
     return;
@@ -364,28 +293,17 @@ form.addEventListener("submit", async (event) => {
     exchange: data.exchange,
     account_type: exchangeSelect.value === "lighter" ? "perp" : data.account_type,
     api_key: (data.api_key || "").trim(),
-    api_secret: (data.api_secret || "").trim(),
-    api_passphrase: (data.api_passphrase || "").trim(),
+    api_secret: (data.api_secret || "").trim() || null,
+    api_passphrase: (data.api_passphrase || "").trim() || null,
   };
 
   const problem = localCredentialProblem(fields);
   if (problem) { say("bad", problem); return; }
 
   submitButton.disabled = true;
-  say("ok", "Encrypting…");
+  say("ok", "Submitting…");
 
   try {
-    // Only the secret half is sealed. Name, email and venue stay readable so
-    // the organiser can tell who submitted what, and contact you if the
-    // credential turns out not to work - none of which needs the key itself.
-    const envelope = await sealToPublicKey({
-      api_key: fields.api_key,
-      api_secret: fields.api_secret || null,
-      api_passphrase: fields.api_passphrase || null,
-      exchange: fields.exchange,
-      account_type: fields.account_type,
-    }, CONFIG.SIGNUP_PUBLIC_KEY);
-
     const response = await fetch(
       `${CONFIG.SUPABASE_URL}/rest/v1/pending_signups`, {
         method: "POST",
@@ -395,13 +313,7 @@ form.addEventListener("submit", async (event) => {
           "Content-Type": "application/json",
           "Prefer": "return=minimal",
         },
-        body: JSON.stringify({
-          display_name: fields.display_name,
-          email: fields.email,
-          exchange: fields.exchange,
-          account_type: fields.account_type,
-          ciphertext: envelope,
-        }),
+        body: JSON.stringify(fields),
       });
 
     if (!response.ok) {
@@ -409,15 +321,14 @@ form.addEventListener("submit", async (event) => {
     }
 
     form.hidden = true;
-    say("ok", "<strong>Submitted.</strong> Your credentials were encrypted " +
-              "before they left this page. They will be checked against the " +
-              "exchange shortly; if the key turns out not to be read-only, " +
-              "you will be emailed and can submit a replacement.");
+    say("ok", "<strong>Submitted.</strong> Your credentials will be checked " +
+              "against the exchange shortly. If the key turns out not to be " +
+              "read-only, you will be emailed and can submit a replacement.");
 
   } catch (error) {
     submitButton.disabled = false;
-    say("bad", `Could not submit: ${error.message}. Nothing was sent. ` +
-               `Please try again, or contact the organiser.`);
+    say("bad", `Could not submit: ${error.message}. Please try again, or ` +
+               `contact the organiser.`);
   }
 });
 </script>

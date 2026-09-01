@@ -7,7 +7,6 @@ from datetime import datetime, timezone
 from supabase import create_client
 from dotenv import load_dotenv
 
-import signup_crypto
 import venues
 from venue_common import get_fernet
 
@@ -228,7 +227,7 @@ def fetch_pending_signups(limit: int = _PENDING_PAGE) -> list[dict]:
     """
     return (supabase.table("pending_signups")
             .select("id,display_name,email,exchange,account_type,"
-                    "ciphertext,attempts")
+                    "api_key,api_secret,api_passphrase,attempts")
             .eq("status", "pending")
             .order("id")
             .limit(limit)
@@ -237,18 +236,24 @@ def fetch_pending_signups(limit: int = _PENDING_PAGE) -> list[dict]:
 
 def _resolve_signup(row_id: int, status: str, error: str = None) -> None:
     """
-    Close out a submission and DESTROY its payload.
+    Close out a submission and WIPE its credential.
 
-    Clearing ciphertext is the point of this function, not a detail of it. An
-    imported credential now lives Fernet-encrypted in participant_api_keys; a
-    rejected one is a credential nobody will ever use. Either way what is
-    left in pending_signups is a secret with no remaining purpose, and the
-    database has a check constraint that refuses to let a resolved row keep
-    one - so a bug here fails loudly rather than quietly hoarding keys.
+    Clearing the three credential columns is the point of this function, not
+    a detail of it. Rows here hold plaintext, so the length of time a
+    credential is readable in the database is exactly the time between
+    submission and this call.
+
+    An imported credential now lives Fernet-encrypted in
+    participant_api_keys; a rejected one is a credential nobody will ever
+    use. Either way what remains in pending_signups is a secret with no
+    purpose. A check constraint refuses to let a resolved row keep one, so a
+    bug here fails loudly rather than quietly hoarding keys.
     """
     supabase.table("pending_signups").update({
         "status": status,
-        "ciphertext": None,
+        "api_key": None,
+        "api_secret": None,
+        "api_passphrase": None,
         "last_error": error,
         "processed_at": datetime.now(timezone.utc).isoformat(),
     }).eq("id", row_id).execute()
@@ -283,30 +288,20 @@ def import_pending_signups(limit: int = _PENDING_PAGE) -> dict:
     for row in pending:
         label = f"#{row['id']} {row.get('display_name') or '?'}"
 
-        # A submission that will not decrypt is never going to decrypt.
-        # Retrying it would only keep an unreadable payload in the table for
-        # longer, so this rejects on the first attempt rather than counting.
-        try:
-            payload = signup_crypto.decrypt(row["ciphertext"] or "")
-        except (ValueError, RuntimeError) as e:
-            logger.error("%s: %s", label, e)
-            _resolve_signup(row["id"], "rejected", f"decryption failed: {e}")
-            counts["rejected"] += 1
-            continue
-
-        # The envelope is authenticated; the plaintext columns are not. So
-        # the venue comes from inside the ciphertext, and a tampered
-        # `exchange` column cannot route a Coinbase key to another adapter.
-        # Identity is taken from the columns, because it was never secret and
-        # is not in the envelope.
+        # Column names deliberately match what verify_and_describe and
+        # register_credential already read, so the same code path serves the
+        # form and the legacy CSV. tests/test_signup_form.py asserts the
+        # form POSTs exactly these names - a typo there would arrive as a
+        # null credential and be rejected as "invalid" rather than as the
+        # spelling mistake it is.
         credential = {
             "username": row["display_name"],
             "email": row["email"],
-            "api_key": payload.get("api_key"),
-            "api_secret": payload.get("api_secret"),
-            "api_passphrase": payload.get("api_passphrase"),
-            "exchange": payload.get("exchange"),
-            "account_type": payload.get("account_type"),
+            "api_key": row.get("api_key"),
+            "api_secret": row.get("api_secret"),
+            "api_passphrase": row.get("api_passphrase"),
+            "exchange": row.get("exchange"),
+            "account_type": row.get("account_type"),
         }
 
         try:
