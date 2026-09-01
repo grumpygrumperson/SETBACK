@@ -45,7 +45,7 @@ Three properties the design turns on:
 ```bash
 uv sync --dev                 # install, including test dependencies
 cp .env.example .env          # then fill in SUPABASE_URL, SUPABASE_KEY, FERNET_KEY
-uv run pytest -q              # 294 tests, no network needed
+uv run pytest -q              # 318 tests, no network needed
 ```
 
 Apply the schema by pasting **`migrations/schema.sql`** into the Supabase SQL
@@ -88,7 +88,9 @@ already put there.
 | `cash_flows` | Deposits and withdrawals, so returns mean something |
 | `fetch_errors` | Per-credential sync failures |
 | `participant_scores` | Current Sharpe per participant, upserted each run |
+| `pending_signups` | The signup form's inbox — ciphertext only |
 | `latest_balances` | *view* — current equity by venue |
+| `daily_balances` | *view* — last snapshot per venue per day; what scoring reads |
 | `leaderboard` | *view* — the ranking |
 
 `leaderboard` sorts on `reliable desc, sharpe desc`. `reliable` means at least
@@ -103,7 +105,10 @@ entries sort below established ones rather than disappearing.
 uv run python post_to_supabase.py     # the hourly job: sync, then score
 uv run python score.py                # rescore from stored history, no fetching
 uv run python score.py --period daily
-uv run python sign_ups.py             # import participant_signups.csv
+uv run python sign_ups.py             # import pending signups from the form
+uv run python sign_ups.py --csv       # legacy: import participant_signups.csv
+uv run python signup_crypto.py --generate   # a new signup keypair
+uv run python signup_crypto.py --public     # the public key, for the form
 uv run python metrics.py              # print Sharpe for everyone
 uv run python rotate_credentials.py --audit   # report credential SHAPES only
 uv run python coinbase.py             # sanity-check the adapter against your own keys
@@ -116,6 +121,58 @@ key is not an outage, and an exit code that fires on any error stops meaning
 anything. Scoring failures never change the exit code: the score recomputes
 from complete history next run, so a failure there is stale ranks, not lost
 data.
+
+---
+
+## Participant signup
+
+Participants submit through a static form that **encrypts their credentials in
+the browser**. The database only ever holds ciphertext.
+
+```
+browser        ephemeral ECDH (P-256) → HKDF-SHA256 → AES-256-GCM
+               against SIGNUP_PUBLIC_KEY, using built-in WebCrypto
+      ↓
+pending_signups   {"v":1,"epk":…,"iv":…,"ct":…}   anon may INSERT, nothing else
+      ↓
+sign_ups.py    decrypt → verify read-only against the exchange
+               → re-encrypt under FERNET_KEY → participant_api_keys
+               → clear the payload
+```
+
+The point is that a form writing straight to Supabase would put plaintext
+exchange keys in a table — and in every backup of it — until someone ran the
+importer, which defeats the entire Fernet layer.
+
+**Setting it up**
+
+1. `uv run python signup_crypto.py --generate`
+2. Put the private half in `.env` as `SIGNUP_PRIVATE_KEY` on the machine that
+   runs the importer. **Not on Railway** — the sync never reads
+   `pending_signups`, and a key it doesn't hold is a key it can't leak.
+3. Fill in the three values in `CONFIG` at the bottom of
+   [`signup_form.html`](signup_form.html): your Supabase URL, your **anon**
+   key, and the public half from step 1.
+4. Host the file anywhere static, **over HTTPS** — WebCrypto is unavailable on
+   insecure origins, and the form disables itself and says so rather than
+   falling back to sending plaintext.
+5. Run `uv run python sign_ups.py` to drain the inbox.
+
+**What the anon key can do.** Insert one row into `pending_signups`. It has no
+`select` policy, so a submitter can't read their row back, can't read anyone
+else's, and can't use the endpoint to probe whether an email is registered.
+Verified against real PostgreSQL, along with a check constraint that refuses
+to let a resolved row keep its payload — so the credential is destroyed on
+import even if the importer has a bug.
+
+**What it doesn't do.** Nothing rate-limits submissions. Sizes are bounded, but
+volume isn't; put Supabase's rate limiting or a captcha in front of the form
+before advertising it publicly.
+
+Verification is asynchronous, so someone who submits a trade-capable key finds
+out later. The reason is stored in `pending_signups.last_error`, and transient
+failures are retried up to `MAX_IMPORT_ATTEMPTS` before the row is rejected and
+its payload destroyed.
 
 ---
 
