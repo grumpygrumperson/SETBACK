@@ -8,19 +8,29 @@
 <!--
   Participant signup form.
 
-  Submits to pending_signups, which anon may INSERT into and cannot read.
-  sign_ups.py then verifies each credential against the exchange, re-encrypts
-  it under FERNET_KEY into participant_api_keys, and wipes the plaintext row.
+  ONE submission registers every venue a participant trades. The page POSTs an
+  ARRAY of rows to pending_signups - one per venue filled in - which PostgREST
+  accepts in a single request.
 
-  Credentials are in PLAINTEXT in that table until the importer runs. Run
-  sign_ups.py often; the window is the whole exposure. See the warning at the
+  That shape is deliberate. A participant on Coinbase spot and Lighter would
+  otherwise have to submit twice, and the likely outcome of asking that is
+  people registering one venue and quietly missing half their equity from the
+  leaderboard. Keeping one ROW per venue (rather than one wide row) means each
+  credential is verified independently: a bad Coinbase key does not cost
+  someone their valid Lighter registration.
+
+  sign_ups.py then verifies each row against the exchange, re-encrypts it
+  under FERNET_KEY into participant_api_keys, and wipes the plaintext.
+
+  Credentials are in PLAINTEXT in pending_signups until the importer runs. Run
+  sign_ups.py often; that window is the whole exposure. See the warning at the
   top of section 8 in migrations/schema.sql.
 
   HOSTING: any static host, over HTTPS. The page holds no secret - the anon
   key is public by design and RLS is what constrains it - so it can be served
-  from a Supabase Storage bucket, GitHub Pages, Netlify, or embedded in a
-  Figma site. Serve it over HTTPS anyway: this form asks people to type
-  exchange credentials, and doing that over http:// sends them in the clear.
+  from Supabase Storage, GitHub Pages, Netlify, or embedded in a Figma site.
+  Serve it over HTTPS anyway: this form asks people to type exchange
+  credentials, and http:// sends them in the clear.
 
   CONFIGURE the two values in CONFIG below before deploying.
 -->
@@ -64,16 +74,19 @@
   .sub { color: var(--muted); margin: 0 0 1.75rem; }
   fieldset { border: 1px solid var(--line); border-radius: 10px; padding: 1.1rem 1.1rem .4rem; margin: 0 0 1.25rem; }
   legend { padding: 0 .4rem; font-weight: 600; font-size: .82rem; text-transform: uppercase; letter-spacing: .07em; color: var(--muted); }
+  .optional { font-weight: 400; text-transform: none; letter-spacing: 0; }
   label { display: block; margin-bottom: 1rem; }
   .lbl { display: block; font-weight: 600; font-size: .9rem; margin-bottom: .3rem; }
   .hint { display: block; font-weight: 400; color: var(--muted); font-size: .82rem; margin-bottom: .35rem; }
-  input, select {
+  .lead { color: var(--muted); font-size: .85rem; margin: -.3rem 0 1rem; }
+  input, textarea {
     width: 100%; padding: .55rem .65rem; font: inherit; font-size: .95rem;
     color: var(--fg); background: var(--field-bg);
     border: 1px solid var(--line); border-radius: 7px;
   }
-  input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: 1px; border-color: transparent; }
-  input[type=password], input.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .88rem; }
+  input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: 1px; border-color: transparent; }
+  input.mono, textarea.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .85rem; }
+  textarea { min-height: 5.5rem; resize: vertical; }
   button {
     width: 100%; padding: .7rem 1rem; font: inherit; font-weight: 600;
     color: var(--accent-fg); background: var(--accent);
@@ -125,43 +138,56 @@
     </label>
     <label>
       <span class="lbl">Email</span>
-      <span class="hint">Used only to contact you if your key stops working.</span>
+      <span class="hint">Used to contact you.</span>
       <input name="email" type="email" required maxlength="320">
     </label>
   </fieldset>
 
+  <p class="lead">
+    Fill in every venue you trade on — you can register all three at once, and
+    you only need to submit this form once. Leave a section blank if you do not
+    trade there.
+  </p>
+
   <fieldset>
-    <legend>Venue</legend>
+    <legend>Coinbase spot <span class="optional">— optional</span></legend>
     <label>
-      <span class="lbl">Exchange</span>
-      <select name="exchange" id="exchange">
-        <option value="coinbase">Coinbase</option>
-        <option value="lighter">Lighter</option>
-      </select>
+      <span class="lbl">API key name</span>
+      <span class="hint">Looks like <code>organizations/…/apiKeys/…</code></span>
+      <input name="coinbase_spot_key" class="mono" maxlength="2000">
     </label>
-    <label id="account-type-field">
-      <span class="lbl">Account type</span>
-      <select name="account_type" id="account_type">
-        <option value="spot">Spot</option>
-        <option value="perp">Perpetuals</option>
-      </select>
+    <label>
+      <span class="lbl">API private key</span>
+      <span class="hint">The whole block, including the BEGIN and END lines.</span>
+      <textarea name="coinbase_spot_secret" class="mono" maxlength="4000"></textarea>
     </label>
   </fieldset>
 
   <fieldset>
-    <legend>Credentials</legend>
+    <legend>Coinbase perpetuals <span class="optional">— optional</span></legend>
+    <p class="lead">
+      Coinbase issues a <em>separate</em> key for perpetuals. If you trade both,
+      you need both keys.
+    </p>
     <label>
-      <span class="lbl" id="key-label">API key</span>
-      <span class="hint" id="key-hint">The key's public identifier.</span>
-      <input name="api_key" id="api_key" class="mono" required maxlength="2000">
+      <span class="lbl">API key name</span>
+      <input name="coinbase_perp_key" class="mono" maxlength="2000">
     </label>
-    <label id="secret-field">
-      <span class="lbl">API secret</span>
-      <input name="api_secret" id="api_secret" type="password" class="mono" maxlength="4000">
+    <label>
+      <span class="lbl">API private key</span>
+      <textarea name="coinbase_perp_secret" class="mono" maxlength="4000"></textarea>
     </label>
-    <label id="passphrase-field">
-      <span class="lbl">Passphrase <span class="hint" style="display:inline">— if your key has one</span></span>
-      <input name="api_passphrase" type="password" class="mono" maxlength="500">
+  </fieldset>
+
+  <fieldset>
+    <legend>Lighter <span class="optional">— optional</span></legend>
+    <label>
+      <span class="lbl">Read-only token</span>
+      <span class="hint">
+        Starts with <code>ro:</code>. Not your wallet private key. Lighter is
+        perpetuals only, so there is nothing else to enter.
+      </span>
+      <textarea name="lighter_token" class="mono" maxlength="2000"></textarea>
     </label>
   </fieldset>
 
@@ -182,10 +208,25 @@
 // Extracted and run under Node by tests/test_signup_form.py. Keep it free of
 // DOM references so it stays runnable outside a browser.
 
-// The exact keys POSTed to pending_signups. They must match the column names
-// in migrations/schema.sql and what sign_ups.py reads, and the test asserts
-// all three agree - a typo here would arrive as a null credential and be
-// reported as an invalid key rather than as the spelling mistake it is.
+// The venues this form can register, and the inputs each one reads.
+//
+// `exchange` and `account_type` must be values migrations/schema.sql allows -
+// there are check constraints on both - and `key`/`secret` name the form
+// inputs, not the columns.
+const VENUES = [
+  { exchange: "coinbase", account_type: "spot", label: "Coinbase spot",
+    key: "coinbase_spot_key", secret: "coinbase_spot_secret" },
+  { exchange: "coinbase", account_type: "perp", label: "Coinbase perpetuals",
+    key: "coinbase_perp_key", secret: "coinbase_perp_secret" },
+  { exchange: "lighter",  account_type: "perp", label: "Lighter",
+    key: "lighter_token",     secret: null },
+];
+
+// The columns each POSTed row carries. These must match pending_signups in
+// migrations/schema.sql and what sign_ups.py selects; the test asserts all
+// three agree. A typo here inserts a row with a NULL credential, and the
+// participant is then told their API KEY was invalid - which sends everyone
+// looking in the wrong place.
 const SUBMIT_FIELDS = [
   "display_name",
   "email",
@@ -193,34 +234,62 @@ const SUBMIT_FIELDS = [
   "account_type",
   "api_key",
   "api_secret",
-  "api_passphrase",
 ];
 
 /**
- * Client-side credential checks.
+ * Turn the filled-in form into the rows to POST.
  *
- * A COURTESY, not a control: anyone can POST to the endpoint directly. The
- * real enforcement is verify_credential() in the venue adapters, which asks
- * the exchange itself what the key can do. This only spares an honest
- * participant a rejection they would otherwise learn about by email hours
- * later - and, for the Lighter case, stops a wallet private key being
- * transmitted at all.
+ * Returns { rows, problem }. A venue is "filled in" if its key field has
+ * anything in it; blank sections are simply skipped, so a participant who
+ * only trades one venue submits one row.
  */
-function localCredentialProblem(fields) {
-  if (fields.exchange === "lighter") {
-    if (!fields.api_key.startsWith("ro:")) {
-      return "Lighter credentials must be a read-only token starting with " +
-             "\"ro:\". A wallet private key cannot be revoked and will be " +
-             "rejected.";
+function buildRows(values) {
+  const rows = [];
+
+  for (const venue of VENUES) {
+    const key = (values[venue.key] || "").trim();
+    const secret = venue.secret ? (values[venue.secret] || "").trim() : "";
+
+    if (!key && !secret) continue;          // section left blank
+
+    if (!key) {
+      return { rows: [], problem:
+        `${venue.label}: you entered a private key but no API key name.` };
     }
-    if (fields.account_type !== "perp") {
-      return "Lighter has no spot market - choose Perpetuals.";
+
+    // A COURTESY, not a control - anyone can POST to the endpoint directly,
+    // and verify_credential in the venue adapters is the real enforcement.
+    // Worth having anyway for Lighter: it stops an irrevocable wallet private
+    // key being transmitted at all, rather than rejecting it after receipt.
+    if (venue.exchange === "lighter" && !key.startsWith("ro:")) {
+      return { rows: [], problem:
+        "Lighter needs a read-only token starting with \"ro:\". A wallet " +
+        "private key cannot be revoked and will be rejected." };
     }
+
+    if (venue.secret && !secret) {
+      return { rows: [], problem:
+        `${venue.label}: Coinbase needs both the API key name and the ` +
+        `private key.` };
+    }
+
+    rows.push({
+      display_name: values.display_name,
+      email: values.email,
+      exchange: venue.exchange,
+      account_type: venue.account_type,
+      api_key: key,
+      api_secret: secret || null,
+    });
   }
-  if (fields.exchange === "coinbase" && !fields.api_secret) {
-    return "Coinbase needs both an API key and an API secret.";
+
+  if (rows.length === 0) {
+    return { rows: [], problem:
+      "Enter credentials for at least one venue - otherwise there is nothing " +
+      "to rank." };
   }
-  return null;
+
+  return { rows, problem: null };
 }
 // ===== END PORTABLE LOGIC ========================================================
 
@@ -235,15 +304,13 @@ const CONFIG = {
 
   // The ANON key, not the service_role key. It is meant to be public: RLS on
   // pending_signups grants anon INSERT and nothing else, so this key can add
-  // a row and can neither read one back nor reach any other table.
+  // rows and can neither read one back nor reach any other table.
   SUPABASE_ANON_KEY: "REPLACE_WITH_SUPABASE_ANON_KEY",
 };
 
 const form = document.getElementById("signup");
 const statusBox = document.getElementById("status");
 const submitButton = document.getElementById("submit");
-const exchangeSelect = document.getElementById("exchange");
-const accountType = document.getElementById("account_type");
 
 // Typing an API key into a page served over http:// sends it in the clear.
 if (!window.isSecureContext) {
@@ -255,28 +322,6 @@ function say(kind, html) {
   statusBox.innerHTML = `<div class="note ${kind}">${html}</div>`;
 }
 
-/** Lighter takes a single token and has no spot market; Coinbase takes a pair. */
-function applyVenueRules() {
-  const lighter = exchangeSelect.value === "lighter";
-
-  document.getElementById("secret-field").hidden = lighter;
-  document.getElementById("passphrase-field").hidden = lighter;
-  document.getElementById("api_secret").required = !lighter;
-
-  document.getElementById("key-label").textContent =
-    lighter ? "Read-only token" : "API key";
-  document.getElementById("key-hint").textContent =
-    lighter ? "Starts with \"ro:\". Not your wallet private key."
-            : "The key's public identifier.";
-
-  accountType.value = lighter ? "perp" : accountType.value;
-  accountType.disabled = lighter;
-  document.getElementById("account-type-field").hidden = lighter;
-}
-
-exchangeSelect.addEventListener("change", applyVenueRules);
-applyVenueRules();
-
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
 
@@ -286,24 +331,20 @@ form.addEventListener("submit", async (event) => {
     return;
   }
 
-  const data = Object.fromEntries(new FormData(form).entries());
-  const fields = {
-    display_name: (data.display_name || "").trim(),
-    email: (data.email || "").trim(),
-    exchange: data.exchange,
-    account_type: exchangeSelect.value === "lighter" ? "perp" : data.account_type,
-    api_key: (data.api_key || "").trim(),
-    api_secret: (data.api_secret || "").trim() || null,
-    api_passphrase: (data.api_passphrase || "").trim() || null,
-  };
+  const values = Object.fromEntries(new FormData(form).entries());
+  values.display_name = (values.display_name || "").trim();
+  values.email = (values.email || "").trim();
 
-  const problem = localCredentialProblem(fields);
+  const { rows, problem } = buildRows(values);
   if (problem) { say("bad", problem); return; }
 
   submitButton.disabled = true;
-  say("ok", "Submitting…");
+  say("ok", `Submitting ${rows.length} credential${rows.length > 1 ? "s" : ""}…`);
 
   try {
+    // One request, one row per venue. PostgREST inserts a JSON array as
+    // multiple rows, and it is a single statement - so either every venue is
+    // registered or none is, and a participant never ends up half-submitted.
     const response = await fetch(
       `${CONFIG.SUPABASE_URL}/rest/v1/pending_signups`, {
         method: "POST",
@@ -313,17 +354,23 @@ form.addEventListener("submit", async (event) => {
           "Content-Type": "application/json",
           "Prefer": "return=minimal",
         },
-        body: JSON.stringify(fields),
+        body: JSON.stringify(rows),
       });
 
     if (!response.ok) {
       throw new Error(`${response.status} ${await response.text()}`);
     }
 
+    const venues = rows.map(r =>
+      r.exchange === "lighter" ? "Lighter"
+        : `Coinbase ${r.account_type === "perp" ? "perpetuals" : "spot"}`);
+
     form.hidden = true;
-    say("ok", "<strong>Submitted.</strong> Your credentials will be checked " +
-              "against the exchange shortly. If the key turns out not to be " +
-              "read-only, you will be emailed and can submit a replacement.");
+    say("ok", `<strong>Submitted — ${venues.join(", ")}.</strong> Your ` +
+              `credentials will be checked against each exchange shortly. If ` +
+              `one turns out not to be read-only you will be emailed about ` +
+              `that venue, and can submit a replacement; the others are ` +
+              `unaffected.`);
 
   } catch (error) {
     submitButton.disabled = false;

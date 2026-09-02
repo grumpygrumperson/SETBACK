@@ -711,7 +711,6 @@ create table if not exists public.pending_signups (
   -- Plaintext, and only until the importer runs. See the warning above.
   api_key        text,
   api_secret     text,                    -- null on single-credential venues
-  api_passphrase text,
 
   status         text not null default 'pending',
   attempts       integer not null default 0,
@@ -725,15 +724,25 @@ create table if not exists public.pending_signups (
 -- appear here too or a database built from an earlier revision never gets it.
 alter table public.pending_signups add column if not exists api_key text;
 alter table public.pending_signups add column if not exists api_secret text;
-alter table public.pending_signups add column if not exists api_passphrase text;
 alter table public.pending_signups add column if not exists attempts integer not null default 0;
 alter table public.pending_signups add column if not exists last_error text;
 alter table public.pending_signups add column if not exists processed_at timestamptz;
 
--- An earlier revision of this file stored a sealed envelope here instead of
--- plaintext columns. Dropped rather than left in place: a column nothing
--- writes and nothing reads is one somebody eventually assumes is meaningful.
+-- Columns from earlier revisions of this file, dropped rather than left in
+-- place: a column nothing writes and nothing reads is one somebody eventually
+-- assumes is meaningful.
+--
+--   ciphertext      held a sealed envelope, before the browser-side
+--                   encryption was traded away for simplicity.
+--   api_passphrase  asked participants for something NEITHER venue uses -
+--                   ccxt.coinbase requires only apiKey and secret, and
+--                   ccxt.lighter only privateKey. It was stored, encrypted,
+--                   and handed over as `password`, which coinbase ignores.
+--                   participant_api_keys keeps its own passphrase column,
+--                   because the venue contract still supports venues that
+--                   need one; nothing reaching this table does.
 alter table public.pending_signups drop column if exists ciphertext;
+alter table public.pending_signups drop column if exists api_passphrase;
 
 -- anon can INSERT into this table, which makes every constraint below a limit
 -- on what an anonymous caller can store. The size bounds are the point:
@@ -765,7 +774,6 @@ alter table public.pending_signups add constraint pending_signups_size_check
     and length(email) between 3 and 320
     and (api_key is null or length(api_key) <= 2000)
     and (api_secret is null or length(api_secret) <= 4000)
-    and (api_passphrase is null or length(api_passphrase) <= 500)
   );
 
 -- A resolved row keeps no credential. Enforced in the database rather than
@@ -776,7 +784,7 @@ alter table public.pending_signups drop constraint if exists pending_signups_res
 alter table public.pending_signups add constraint pending_signups_resolved_is_empty
   check (
     status = 'pending'
-    or (api_key is null and api_secret is null and api_passphrase is null)
+    or (api_key is null and api_secret is null)
   );
 
 

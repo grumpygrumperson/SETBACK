@@ -227,7 +227,7 @@ def fetch_pending_signups(limit: int = _PENDING_PAGE) -> list[dict]:
     """
     return (supabase.table("pending_signups")
             .select("id,display_name,email,exchange,account_type,"
-                    "api_key,api_secret,api_passphrase,attempts")
+                    "api_key,api_secret,attempts")
             .eq("status", "pending")
             .order("id")
             .limit(limit)
@@ -253,7 +253,6 @@ def _resolve_signup(row_id: int, status: str, error: str = None) -> None:
         "status": status,
         "api_key": None,
         "api_secret": None,
-        "api_passphrase": None,
         "last_error": error,
         "processed_at": datetime.now(timezone.utc).isoformat(),
     }).eq("id", row_id).execute()
@@ -294,12 +293,16 @@ def import_pending_signups(limit: int = _PENDING_PAGE) -> dict:
         # form POSTs exactly these names - a typo there would arrive as a
         # null credential and be rejected as "invalid" rather than as the
         # spelling mistake it is.
+        # No passphrase: ccxt.coinbase requires only apiKey and secret, and
+        # ccxt.lighter only privateKey, so the form never asks for one. The
+        # venue contract still supports it - coinbase.verify_credential reads
+        # api_passphrase when present - which is why participant_api_keys
+        # keeps the column and this dict simply omits it.
         credential = {
             "username": row["display_name"],
             "email": row["email"],
             "api_key": row.get("api_key"),
             "api_secret": row.get("api_secret"),
-            "api_passphrase": row.get("api_passphrase"),
             "exchange": row.get("exchange"),
             "account_type": row.get("account_type"),
         }

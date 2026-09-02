@@ -45,7 +45,7 @@ Three properties the design turns on:
 ```bash
 uv sync --dev                 # install, including test dependencies
 cp .env.example .env          # then fill in SUPABASE_URL, SUPABASE_KEY, FERNET_KEY
-uv run pytest -q              # 301 tests, no network needed
+uv run pytest -q              # 308 tests, no network needed
 ```
 
 Apply the schema by pasting **`migrations/schema.sql`** into the Supabase SQL
@@ -134,6 +134,23 @@ form  →  pending_signups        anon may INSERT, and nothing else
                                 → Fernet-encrypt → participant_api_keys
                                 → wipe the plaintext row
 ```
+
+**One submission registers every venue.** The page asks for Coinbase spot,
+Coinbase perpetuals and Lighter together, and POSTs an array of one to three
+rows — one per venue filled in. Each section is optional; at least one is
+required. Keeping a row per venue rather than one wide row means each
+credential is verified independently, so a bad Coinbase key does not cost
+someone their valid Lighter registration.
+
+| Venue | What the participant pastes |
+|---|---|
+| Coinbase spot | Key name (`organizations/…/apiKeys/…`) **and** the EC private key |
+| Coinbase perps | A *separate* key — Coinbase issues different credentials for perps |
+| Lighter | The `ro:` read-only token, and nothing else |
+
+No passphrase is asked for: `ccxt.coinbase` requires only `apiKey` and
+`secret`, and `ccxt.lighter` only `privateKey`. Coinbase's INTX portfolio UUID
+is resolved automatically at verification, so participants never supply it.
 
 **Setting it up**
 
