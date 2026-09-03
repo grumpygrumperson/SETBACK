@@ -1,0 +1,22 @@
+@import "tailwindcss";
+
+/* Committed to a single dark theme rather than following the OS. A board that
+   is projected on a screen during a competition should look the same to
+   everyone watching it. */
+:root {
+  --background: #08090b;
+  --foreground: #ededed;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-geist-sans), system-ui, sans-serif;
+}
